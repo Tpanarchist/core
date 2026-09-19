@@ -129,7 +129,16 @@ class TestCanonicalRecordRecursion:
 
 class TestCanonicalRecordAllTypes:
     def test_every_admitted_entity_type_canonicalizes_without_error(self) -> None:
+        from core.effect import Effect
+        from core.observation import Observation
+        from core.provenance import Provenance
+        from core.time import Duration
+
         claim = make_claim("c1")
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="reading",
+            at=AT, source="sensor-1", context=CTX,
+        )
         records = [
             claim,
             Inference(
@@ -143,6 +152,17 @@ class TestCanonicalRecordAllTypes:
             ),
             Event(id=Id(EVENT_KIND, "e1"), kind=EVENT_KIND, at=AT, payload="p"),
             Error(id=Id(ERROR_KIND, "err1"), kind=ERROR_KIND, message="m", at=AT),
+            obs,
+            Effect(
+                id=Id(Kind("memory.test.effect"), "f1"), kind=Kind("memory.test.k"),
+                description="did a thing", target="str target", at=AT,
+            ),
+            Provenance(
+                id=Id(Kind("memory.test.prov"), "p1"),
+                transform_id=Id(Kind("memory.test.tx"), "t1"),
+                transform_name="normalize", transform_version="1.0", inputs=(), parents=(),
+                at=AT, duration=Duration(0),
+            ),
         ]
         for record in records:
             assert isinstance(_canonical_record(record), tuple)
@@ -316,6 +336,31 @@ class TestIdentityCollision:
             store.persist(e2)
 
 
+class TestDuplicateIdWithinSingleOperation:
+    def test_inference_id_equals_conclusion_id_raises_atomically(self) -> None:
+        store = InMemoryStore()
+        shared_id = Id(Kind("memory.test.shared"), "x1")
+        claim: Claim[object] = Claim(
+            id=shared_id, subject=SUBJECT, predicate=Kind("memory.test.p"),
+            value=Known("v"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        inference = Inference(
+            id=shared_id, premises=(), method=Kind("memory.test.m"), conclusion=claim, at=AT
+        )
+        with pytest.raises(IdentityCollision):
+            store.persist(inference)
+        assert store.resolve(shared_id) is None
+
+    def test_error_chain_reusing_id_raises_atomically(self) -> None:
+        store = InMemoryStore()
+        shared_id = Id(Kind("memory.test.shared"), "x2")
+        root = Error(id=shared_id, kind=ERROR_KIND, message="root", at=AT)
+        wrap = Error(id=shared_id, kind=ERROR_KIND, message="wrap", at=AT, cause=root)
+        with pytest.raises(IdentityCollision):
+            store.persist(wrap)
+        assert store.resolve(shared_id) is None
+
+
 class TestPersistDoesNotMutateCallerOrLeakMutation:
     def test_pa_08_persist_does_not_mutate_source_record(self) -> None:
         from core.observation import Observation
@@ -443,6 +488,22 @@ class TestEmbeddedEntities:
         assert store.resolve(claim.id) == claim
         assert store.resolve(inference.id) == inference
 
+    def test_persist_inference_commits_claim_before_inference_in_entity_order(self) -> None:
+        # §35: the Claim conclusion must be committed before the Inference
+        # itself, so a durable backend replaying _entity_order reproduces
+        # the same commit order. White-box test of the store's own
+        # bookkeeping — deliberate, since §35 freezes this as observable
+        # reference behavior a Pass-3 backend must reproduce.
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        inference = Inference(
+            id=Id(Kind("memory.test.inference"), "i1"), premises=(),
+            method=Kind("memory.test.m"), conclusion=claim, at=AT,
+        )
+        store.persist(inference)
+        order = store._entity_order  # pyright: ignore[reportPrivateUsage]
+        assert order.index(claim.id) < order.index(inference.id)
+
     def test_persist_inference_where_embedded_conclusion_conflicts_fails_atomically(self) -> None:
         store = InMemoryStore()
         store.persist(make_claim("c1", value="already stored"))
@@ -465,6 +526,19 @@ class TestEmbeddedEntities:
         resolved_root = store.resolve(root.id)
         assert resolved_root is not None
         assert resolved_root.message == "root"  # type: ignore[union-attr]
+
+    def test_persist_error_commits_root_cause_before_wrapping_error_in_entity_order(self) -> None:
+        # §35: the root cause must be committed before the wrapping Error,
+        # matching the same ordering guarantee as Claim-before-Inference.
+        # White-box test of the store's own bookkeeping, deliberate per §35.
+        store = InMemoryStore()
+        root = Error(id=Id(ERROR_KIND, "root"), kind=ERROR_KIND, message="root", at=AT)
+        wrapping = Error(
+            id=Id(ERROR_KIND, "wrap"), kind=ERROR_KIND, message="wrap", at=AT, cause=root
+        )
+        store.persist(wrapping)
+        order = store._entity_order  # pyright: ignore[reportPrivateUsage]
+        assert order.index(root.id) < order.index(wrapping.id)
 
     def test_persist_error_where_nested_cause_collides_fails_atomically(self) -> None:
         store = InMemoryStore()
@@ -520,6 +594,30 @@ class TestEmbeddedEntities:
             store.persist(wrapping)
         assert store.resolve(root.id) is None
         assert store.resolve(wrapping.id) is None
+
+
+class TestEmbeddedIdentityParticipatesInCanonicalForm:
+    def test_inference_conclusion_identity_swap_is_not_idempotent(self) -> None:
+        store = InMemoryStore()
+        i1 = Id(Kind("memory.test.inference"), "i1")
+        c1 = make_claim("c1")
+        c2 = make_claim("c2")
+        inf1 = Inference(id=i1, premises=(), method=Kind("memory.test.m"), conclusion=c1, at=AT)
+        inf2 = Inference(id=i1, premises=(), method=Kind("memory.test.m"), conclusion=c2, at=AT)
+        store.persist(inf1)
+        with pytest.raises(IdentityCollision):
+            store.persist(inf2)
+
+    def test_error_cause_identity_swap_is_not_idempotent(self) -> None:
+        store = InMemoryStore()
+        wrap_id = Id(ERROR_KIND, "wrap")
+        root1 = Error(id=Id(ERROR_KIND, "root1"), kind=ERROR_KIND, message="r", at=AT)
+        root2 = Error(id=Id(ERROR_KIND, "root2"), kind=ERROR_KIND, message="r", at=AT)
+        wrap1 = Error(id=wrap_id, kind=ERROR_KIND, message="w", at=AT, cause=root1)
+        wrap2 = Error(id=wrap_id, kind=ERROR_KIND, message="w", at=AT, cause=root2)
+        store.persist(wrap1)
+        with pytest.raises(IdentityCollision):
+            store.persist(wrap2)
 
 
 class TestClaimsFor:
@@ -810,6 +908,26 @@ class TestEpisodeStoreSurface:
         # must not raise
         store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
 
+    def test_same_header_create_after_items_and_close_preserves_state(self) -> None:
+        # An idempotent re-create_episode() call must be a true no-op against
+        # an Episode that has since acquired items and been closed — it must
+        # not reset either, since create_episode()'s idempotency check
+        # concerns only the immutable header (subject/context/opened_at).
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        item = Ref(id=Id(Kind("memory.test.item"), "x"))
+        store.append_episode(episode_id, item)
+        closed_at = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+        store.close_episode(episode_id, closed_at)
+
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)  # no-op
+
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (item,)
+        assert resolved.closed_at == closed_at
+
     def test_different_header_same_id_collides(self) -> None:
         store = InMemoryStore()
         episode_id = Id(Kind("memory.test.episode"), "ep1")
@@ -1063,6 +1181,27 @@ class TestRetrievalQuery:
 
 
 class TestRetrieve:
+    def test_inference_conclusion_text_searchable_under_claim_identity_only(self) -> None:
+        # §54: an Inference's conclusion text is searchable under the
+        # Claim's identity, never duplicated under the Inference's own
+        # identity — persisting an Inference registers its Claim as an
+        # independently retrievable entity (§35), and lexical_content()
+        # contributes nothing for Inference itself, so a text query must
+        # produce exactly one candidate, pointing at the Claim's Id.
+        store = InMemoryStore()
+        claim = make_claim("c1", value="a very findable conclusion")
+        inference = Inference(
+            id=Id(Kind("memory.test.inference"), "i1"), premises=(),
+            method=Kind("memory.test.m"), conclusion=claim, at=AT,
+        )
+        store.persist(inference)
+        candidates = store.retrieve(
+            RetrievalQuery(context=CTX, text="findable conclusion"), retrieved_at=AT
+        )
+        assert len(candidates) == 1
+        assert candidates[0].item.id == claim.id
+        assert candidates[0].item.id != inference.id
+
     def test_identity_only_retrieval(self) -> None:
         from core.observation import Observation
 
@@ -1105,7 +1244,7 @@ class TestRetrieve:
         assert len(candidates) == 1
         assert candidates[0].relevance == (IDENTITY_MATCH, LEXICAL_MATCH)
 
-    def test_retrieved_at_and_query_context_copied_exactly(self) -> None:
+    def test_retrieved_at_and_query_context_preserved(self) -> None:
         from core.observation import Observation
 
         store = InMemoryStore()

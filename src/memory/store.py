@@ -160,6 +160,7 @@ def _canonical_inference(inference: Inference[object]) -> tuple[object, ...]:
         "inference",
         _canonical_refs(inference.premises),
         encode_kind(inference.method),
+        encode_id(inference.conclusion.id),
         _canonical_claim(inference.conclusion),
         encode_wall_instant(inference.at),
     )
@@ -217,7 +218,11 @@ def _canonical_error(error: Error) -> tuple[object, ...]:
         encode_kind(error.kind),
         error.message,
         encode_wall_instant(error.at),
-        _canonical_error(error.cause) if error.cause is not None else None,
+        (
+            (encode_id(error.cause.id), _canonical_error(error.cause))
+            if error.cause is not None
+            else None
+        ),
         _canonical_optional_context(error.context),
         error.operation,
         error.recoverable,
@@ -235,9 +240,16 @@ def _canonical_record(
     here — Resolution/RetentionMark never do (append-only, no canonical
     comparison), and Episode uses _canonical_episode_header instead.
 
-    Called from InMemoryStore.persist() (via _snapshot_simple_entity's
-    fallthrough branch) for identity-collision detection. Also still used
-    directly from tests.
+    Called from InMemoryStore.persist() directly, after
+    _snapshot_simple_entity() has already returned a snapshotted record (for
+    Observation/Event/Effect/Contradiction/Provenance) — persist() handles
+    Claim/Inference/Error/Resolution/RetentionMark separately before ever
+    reaching this call. Episode is rejected earlier still, inside
+    _snapshot_simple_entity() itself, so this function's own final `raise`
+    below is reached through persist() only for a record type outside the
+    union entirely; it is also still used directly from tests (including
+    against Episode, to exercise the create_episode() hint independently of
+    persist()'s own rejection path).
     """
     if isinstance(record, Observation):
         return _canonical_observation(record)
@@ -304,6 +316,8 @@ class InMemoryStore:
         raise IdentityCollision(id, type(existing), incoming_type)
 
     def _commit(self, id: Id, record: EntityMemoryRecord, canonical: tuple[object, ...]) -> None:
+        if id in self._entities:
+            raise IdentityCollision(id, type(self._entities[id]), type(record))
         self._entities[id] = record
         self._entity_canonical[id] = canonical
         self._entity_order.append(id)
@@ -384,7 +398,7 @@ class InMemoryStore:
                     else None
                 ),
             )
-        return record
+        raise UnsupportedMemoryRecord(type(record))
 
     def _snapshot_claim(self, claim: Claim[object]) -> Claim[object]:
         if isinstance(claim.value, Known):
@@ -429,11 +443,12 @@ class InMemoryStore:
             if action == "insert":
                 self._commit(stored.id, stored, canonical)
             return
-        # Anything else falls through to canonicalization directly — no separate
-        # isinstance guard here: _canonical_record() already raises
-        # UnsupportedMemoryRecord for anything outside the 8 canonicalizable
-        # types, so a redundant pre-check here would only duplicate that check
-        # (and trip Pyright's reportUnnecessaryIsInstance besides).
+        # Anything else falls through to snapshotting directly — no separate
+        # isinstance guard here: _snapshot_simple_entity() already raises
+        # UnsupportedMemoryRecord for anything outside its 5 recognized types
+        # (Episode included), so a redundant pre-check here would only
+        # duplicate that check (and trip Pyright's reportUnnecessaryIsInstance
+        # besides).
         stored = self._snapshot_simple_entity(record)
         canonical = _canonical_record(stored)
         action = self._check(stored.id, canonical, type(record))
@@ -445,6 +460,8 @@ class InMemoryStore:
 
     def _persist_inference(self, inference: Inference[object]) -> None:
         stored_claim = self._snapshot_claim(inference.conclusion)
+        if inference.id == stored_claim.id:
+            raise IdentityCollision(inference.id, Claim, Inference)
         claim_canonical = _canonical_claim(stored_claim)
         claim_action = self._check(stored_claim.id, claim_canonical, Claim)
 
@@ -475,6 +492,12 @@ class InMemoryStore:
             chain.append(current)
             current = current.cause
         chain.reverse()  # root cause first
+
+        seen_ids: set[Id] = set()
+        for link in chain:
+            if link.id in seen_ids:
+                raise IdentityCollision(link.id, Error, Error)
+            seen_ids.add(link.id)
 
         prepared: list[tuple[Id, Error, tuple[object, ...], str]] = []
         rebuilt_cause: Error | None = None
@@ -576,6 +599,12 @@ class InMemoryStore:
         episode = Episode(
             id=id, subject=subject, context=self._snapshot_context(context), opened_at=opened_at
         )
+        # Deliberately not routed through _commit(): self._entity_canonical is
+        # left unset for this id. That absence is exactly what makes _check()
+        # correctly raise IdentityCollision when a later generic persist()
+        # call collides against an existing Episode's Id (Episode has no
+        # canonical form of its own — only _canonical_episode_header, which
+        # _check() never consults). Do not "tidy" this into a _commit() call.
         self._entities[id] = episode
         self._entity_order.append(id)
 
