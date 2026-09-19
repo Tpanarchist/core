@@ -235,8 +235,7 @@ def _canonical_record(
 
     Called from InMemoryStore.persist() (via _snapshot_simple_entity's
     fallthrough branch) for identity-collision detection. Also still used
-    directly from tests. _canonical_episode_header below remains unused until
-    Task 4 wires it into create_episode(), hence its own ignore comment.
+    directly from tests.
     """
     if isinstance(record, Observation):
         return _canonical_observation(record)
@@ -257,7 +256,7 @@ def _canonical_record(
     raise UnsupportedMemoryRecord(type(record))
 
 
-def _canonical_episode_header(  # pyright: ignore[reportUnusedFunction]
+def _canonical_episode_header(
     *, subject: Id | Ref, context: Context, opened_at: WallInstant
 ) -> tuple[object, ...]:
     """Canonical form of only an Episode's immutable header (subject, context,
@@ -544,3 +543,47 @@ class InMemoryStore:
             elif entry.contradiction.id in relevant_ids:
                 result.append(entry)
         return tuple(result)
+
+    def retention_for(self, item: Id | Ref) -> tuple[RetentionMark, ...]:
+        target = identity_of(item)
+        return tuple(mark for mark in self._retention_marks if identity_of(mark.item) == target)
+
+    def create_episode(
+        self, *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant
+    ) -> None:
+        encode_context(context)  # validates; raises UnsupportedPersistedValue if malformed
+        existing = self._entities.get(id)
+        incoming_header = _canonical_episode_header(
+            subject=subject, context=context, opened_at=opened_at
+        )
+        if existing is not None:
+            if not isinstance(existing, Episode):
+                raise IdentityCollision(id, type(existing), Episode)
+            existing_header = _canonical_episode_header(
+                subject=existing.subject, context=existing.context, opened_at=existing.opened_at
+            )
+            if existing_header != incoming_header:
+                raise IdentityCollision(id, Episode, Episode)
+            return  # idempotent success
+        episode = Episode(
+            id=id, subject=subject, context=self._snapshot_context(context), opened_at=opened_at
+        )
+        self._entities[id] = episode
+        self._entity_order.append(id)
+
+    def _require_episode(self, episode: Id | Ref) -> Episode:
+        target = identity_of(episode)
+        stored = self._entities.get(target)
+        if stored is None:
+            raise KeyError(target)
+        if not isinstance(stored, Episode):
+            raise TypeError(f"Id {target!r} does not name an Episode")
+        return stored
+
+    def append_episode(self, episode: Id | Ref, item: Ref) -> None:
+        stored = self._require_episode(episode)
+        stored.append(item)
+
+    def close_episode(self, episode: Id | Ref, at: WallInstant) -> None:
+        stored = self._require_episode(episode)
+        stored.close(at)

@@ -18,6 +18,8 @@ from core.event import Event
 from core.identity import Id, Namespace, Ref
 from core.time import WallInstant
 from core.value import Kind, Known, Unknown
+from memory.episode import Episode
+from memory.retention import RetentionMark
 from memory.store import (
     IdentityCollision,
     InMemoryStore,
@@ -630,3 +632,155 @@ class TestConflictsFor:
         store.persist(contradiction)
         result = store.conflicts_for(SUBJECT, Kind("memory.test.p"))
         assert result.count(contradiction) == 1
+
+
+class TestRetentionFor:
+    def test_matches_via_identity_of(self) -> None:
+        from memory.retention import ACTIVE
+
+        store = InMemoryStore()
+        target = Ref(id=Id(Kind("memory.test.item"), "x"))
+        mark = RetentionMark(item=target, accessibility=ACTIVE, at=AT)
+        store.persist(mark)
+        assert store.retention_for(Id(Kind("memory.test.item"), "x")) == (mark,)
+
+    def test_no_marks_returns_empty_tuple(self) -> None:
+        store = InMemoryStore()
+        assert store.retention_for(Id(Kind("memory.test.item"), "nomarks")) == ()
+
+    def test_duplicate_marks_all_preserved(self) -> None:
+        from memory.retention import ARCHIVED
+
+        store = InMemoryStore()
+        target = Id(Kind("memory.test.item"), "x")
+        mark1 = RetentionMark(item=Ref(id=target), accessibility=ARCHIVED, at=AT)
+        mark2 = RetentionMark(item=Ref(id=target), accessibility=ARCHIVED, at=AT)
+        store.persist(mark1)
+        store.persist(mark2)
+        assert store.retention_for(target) == (mark1, mark2)
+
+    def test_namespace_does_not_bypass_mark(self) -> None:
+        from memory.retention import ARCHIVED
+
+        store = InMemoryStore()
+        target = Id(Kind("memory.test.item"), "x")
+        mark = RetentionMark(
+            item=Ref(id=target, namespace=Namespace(("finance",))), accessibility=ARCHIVED, at=AT
+        )
+        store.persist(mark)
+        assert store.retention_for(Ref(id=target, namespace=Namespace(("ledger",)))) == (mark,)
+
+
+class TestEpisodeStoreSurface:
+    def test_create_empty_open_episode(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == ()
+        assert resolved.closed_at is None
+
+    def test_same_header_create_is_idempotent(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        # must not raise
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+
+    def test_different_header_same_id_collides(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        with pytest.raises(IdentityCollision):
+            store.create_episode(
+                id=episode_id, subject=Id(SUBJECT_KIND, "different"), context=CTX, opened_at=AT
+            )
+
+    def test_episode_id_collides_globally_with_another_entity_type(self) -> None:
+        store = InMemoryStore()
+        shared_id = Id(Kind("memory.test.episode"), "ep1")
+        store.persist(Event(id=shared_id, kind=EVENT_KIND, at=AT, payload="p"))
+        with pytest.raises(IdentityCollision):
+            store.create_episode(id=shared_id, subject=SUBJECT, context=CTX, opened_at=AT)
+
+    def test_append_exact_order_and_duplicates_preserved(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        ref_a = Ref(id=Id(Kind("memory.test.item"), "a"))
+        ref_b = Ref(id=Id(Kind("memory.test.item"), "b"))
+        store.append_episode(episode_id, ref_a)
+        store.append_episode(episode_id, ref_b)
+        store.append_episode(episode_id, ref_a)  # duplicate
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (ref_a, ref_b, ref_a)
+
+    def test_append_to_missing_episode_raises_keyerror(self) -> None:
+        store = InMemoryStore()
+        with pytest.raises(KeyError):
+            store.append_episode(
+                Id(Kind("memory.test.episode"), "missing"),
+                Ref(id=Id(Kind("memory.test.item"), "x")),
+            )
+
+    def test_append_to_non_episode_id_raises_typeerror(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        store.persist(claim)
+        with pytest.raises(TypeError):
+            store.append_episode(claim.id, Ref(id=Id(Kind("memory.test.item"), "x")))
+
+    def test_append_after_close_raises(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.close_episode(episode_id, AT)
+        with pytest.raises(ValueError):
+            store.append_episode(episode_id, Ref(id=Id(Kind("memory.test.item"), "x")))
+
+    def test_close_once_then_twice_raises(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.close_episode(episode_id, AT)
+        with pytest.raises(ValueError):
+            store.close_episode(episode_id, AT)
+
+    def test_close_before_open_raises(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        opened_at = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=opened_at)
+        with pytest.raises(ValueError):
+            store.close_episode(episode_id, AT)  # AT is 2024-01-01, before opened_at
+
+    def test_resolved_episode_is_a_snapshot_not_live_store_state(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        first_snapshot = store.resolve(episode_id)
+        assert isinstance(first_snapshot, Episode)
+        store.append_episode(episode_id, Ref(id=Id(Kind("memory.test.item"), "x")))
+        assert first_snapshot.items() == ()  # earlier snapshot unaffected
+
+    def test_caller_mutation_of_resolved_episode_does_not_mutate_store(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        resolved.append(Ref(id=Id(Kind("memory.test.item"), "x")))  # mutate the returned snapshot
+        assert store.resolve(episode_id).items() == ()  # type: ignore[union-attr]
+
+    def test_episode_context_mutation_after_create_does_not_leak(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        mutable_scope: dict[str, object] = {"k": 1}
+        ctx = Context(as_of=AT, scope=mutable_scope)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=ctx, opened_at=AT)
+        mutable_scope["k"] = 999
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert dict(resolved.context.scope) == {"k": 1}  # type: ignore[arg-type]
