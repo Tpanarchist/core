@@ -11,7 +11,12 @@ from types import MappingProxyType
 import pytest
 from _memory_side_effects import assert_fresh_import_has_no_side_effects
 
-from memory.codec import UnsupportedPersistedValue, as_persisted_value
+from memory.codec import (
+    UnsupportedPersistedValue,
+    as_persisted_value,
+    decode_persisted_value,
+    encode_persisted_value,
+)
 
 
 class TestScalars:
@@ -200,3 +205,57 @@ class TestImportSideEffects:
             "memory.codec",
             patch_targets=("uuid.uuid4", "time.time", "time.monotonic"),
         )
+
+
+class TestCanonicalEncoding:
+    def test_cd_07_unicode_spellings_not_normalized(self) -> None:
+        import unicodedata
+
+        # NFC form (single codepoint U+00E9)
+        composed = "é"  # e + combining acute
+        composed = unicodedata.normalize("NFC", composed)
+        # NFD form (e + combining acute, two codepoints)
+        decomposed = unicodedata.normalize("NFD", "é")  # Starting from single codepoint
+        assert composed != decomposed
+        assert decode_persisted_value(encode_persisted_value(composed)) == composed
+        assert decode_persisted_value(encode_persisted_value(decomposed)) == decomposed
+        assert encode_persisted_value(composed) != encode_persisted_value(decomposed)
+
+    def test_cd_10_mapping_key_order_yields_identical_bytes(self) -> None:
+        first = encode_persisted_value(MappingProxyType({"a": 1, "b": 2}))
+        second = encode_persisted_value(MappingProxyType({"b": 2, "a": 1}))
+        assert first == second
+
+    def test_round_trips_every_scalar_kind(self) -> None:
+        for value in (None, True, False, 0, -1, 2**300, 1.5, "s", b"\x00\x01"):
+            assert decode_persisted_value(encode_persisted_value(value)) == value
+
+    def test_round_trips_nested_containers(self) -> None:
+        value = (1, MappingProxyType({"x": (True, None, "y")}), b"z")
+        assert decode_persisted_value(encode_persisted_value(value)) == value
+
+    def test_fl_02_negative_zero_round_trips_with_sign(self) -> None:
+        import math
+
+        decoded = decode_persisted_value(encode_persisted_value(-0.0))
+        assert isinstance(decoded, float)
+        assert math.copysign(1.0, decoded) == -1.0
+
+    def test_fl_07_repeated_encoding_is_byte_identical(self) -> None:
+        value = (1, "x", 2.5, MappingProxyType({"k": True}))
+        assert encode_persisted_value(value) == encode_persisted_value(value)
+
+    def test_cd_04_large_int_round_trips_exactly(self) -> None:
+        huge = 2**256 + 12345
+        assert decode_persisted_value(encode_persisted_value(huge)) == huge
+
+    def test_unknown_codec_version_fails_loudly(self) -> None:
+        import json
+
+        malformed = json.dumps(["memory.persisted_value", 999, ["none"]]).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_malformed_envelope_fails_loudly(self) -> None:
+        with pytest.raises(ValueError):
+            decode_persisted_value(b"not json at all")
