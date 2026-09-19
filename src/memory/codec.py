@@ -131,35 +131,71 @@ def _encode_node(value: PersistedValue) -> object:
     if isinstance(value, Mapping):  # type: ignore[reportUnnecessaryIsInstance]
         pairs = sorted(value.items(), key=lambda pair: pair[0])
         return ["map", [[key, _encode_node(item)] for key, item in pairs]]
-    raise TypeError(f"not a PersistedValue: {value!r}")
+    raise TypeError(f"not a PersistedValue: {type(value).__name__}")
 
 
 def _decode_node(node: object) -> PersistedValue:
+    """Decode one canonical node. ``node`` comes from parsed, but otherwise
+    untrusted, external bytes — every branch validates its own payload shape
+    and raises ``ValueError`` (never IndexError/TypeError/other) on anything
+    malformed, exactly like _unenvelope() already does at the envelope level.
+    """
     if not (isinstance(node, list) and node):
         raise ValueError(f"malformed persisted-value node: {node!r}")
     node_list = cast(list[object], node)
     tag = node_list[0]
     rest = node_list[1:]
     if tag == "none":
+        if rest:
+            raise ValueError(f"malformed 'none' node: {node!r}")
         return None
     if tag == "bool":
-        return bool(rest[0])
+        if len(rest) != 1 or not isinstance(rest[0], bool):
+            raise ValueError(f"malformed 'bool' node: {node!r}")
+        return rest[0]
     if tag == "int":
-        return int(cast(str, rest[0]))
+        if len(rest) != 1 or not isinstance(rest[0], str):
+            raise ValueError(f"malformed 'int' node: {node!r}")
+        try:
+            return int(rest[0])
+        except ValueError as exc:
+            raise ValueError(f"malformed 'int' payload: {node!r}") from exc
     if tag == "float":
-        return float.fromhex(cast(str, rest[0]))
+        if len(rest) != 1 or not isinstance(rest[0], str):
+            raise ValueError(f"malformed 'float' node: {node!r}")
+        try:
+            return float.fromhex(rest[0])
+        except ValueError as exc:
+            raise ValueError(f"malformed 'float' payload: {node!r}") from exc
     if tag == "str":
-        return cast(str, rest[0])
+        if len(rest) != 1 or not isinstance(rest[0], str):
+            raise ValueError(f"malformed 'str' node: {node!r}")
+        return rest[0]
     if tag == "bytes":
-        return base64.b64decode(cast(str, rest[0]))
+        if len(rest) != 1 or not isinstance(rest[0], str):
+            raise ValueError(f"malformed 'bytes' node: {node!r}")
+        try:
+            return base64.b64decode(rest[0], validate=True)
+        except ValueError as exc:
+            raise ValueError(f"malformed 'bytes' payload: {node!r}") from exc
     if tag == "tuple":
+        if len(rest) != 1 or not isinstance(rest[0], list):
+            raise ValueError(f"malformed 'tuple' node: {node!r}")
         tuple_items = cast(list[object], rest[0])
         return tuple(_decode_node(item) for item in tuple_items)
     if tag == "map":
-        map_items = cast(list[list[object]], rest[0])
-        return MappingProxyType(
-            {cast(str, key): _decode_node(item) for key, item in map_items}
-        )
+        if len(rest) != 1 or not isinstance(rest[0], list):
+            raise ValueError(f"malformed 'map' node: {node!r}")
+        result: dict[str, PersistedValue] = {}
+        map_items = cast(list[object], rest[0])
+        for pair in map_items:
+            pair_list = cast(list[object], pair)
+            if not (len(pair_list) == 2 and isinstance(pair_list[0], str)):
+                raise ValueError(f"malformed 'map' entry: {pair!r}")
+            key = pair_list[0]
+            item = pair_list[1]
+            result[key] = _decode_node(item)
+        return MappingProxyType(result)
     raise ValueError(f"unknown persisted-value tag: {tag!r}")
 
 

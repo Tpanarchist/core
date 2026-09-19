@@ -259,3 +259,49 @@ class TestCanonicalEncoding:
     def test_malformed_envelope_fails_loudly(self) -> None:
         with pytest.raises(ValueError):
             decode_persisted_value(b"not json at all")
+
+    def test_encode_never_calls_repr_as_fallback(self) -> None:
+        """Regression test: _encode_node must not call repr() on unvalidated values."""
+
+        class Loud:
+            def __repr__(self) -> str:
+                raise AssertionError("repr() must never be called in _encode_node fallback")
+
+        with pytest.raises(TypeError):
+            encode_persisted_value(Loud())  # type: ignore[arg-type]
+
+    def test_decode_str_payload_must_be_string(self) -> None:
+        """Regression test: ["str", 42] must raise ValueError, not silently return 42."""
+        import json
+
+        malformed = json.dumps(["memory.persisted_value", 1, ["str", 42]]).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_decode_map_key_must_be_string(self) -> None:
+        """Regression test: map with non-string key must raise ValueError."""
+        import json
+
+        malformed = json.dumps(
+            ["memory.persisted_value", 1, ["map", [[42, ["none"]]]]]
+        ).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_decode_bool_missing_payload_raises_valueerror(self) -> None:
+        """Regression test: ["bool"] must raise ValueError, not IndexError."""
+        import json
+
+        malformed = json.dumps(["memory.persisted_value", 1, ["bool"]]).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_decode_bool_non_bool_payload_raises_valueerror(self) -> None:
+        """Regression test: ["bool", "not a bool"] must raise ValueError, not silently coerce."""
+        import json
+
+        malformed = json.dumps(
+            ["memory.persisted_value", 1, ["bool", "not a bool"]]
+        ).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
