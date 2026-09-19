@@ -6,16 +6,36 @@ and I (float handling).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import MappingProxyType
 
 import pytest
 from _memory_side_effects import assert_fresh_import_has_no_side_effects
 
+from core.context import Context
+from core.identity import Id, Namespace, Ref
+from core.time import Duration, WallInstant
+from core.value import Kind
 from memory.codec import (
     UnsupportedPersistedValue,
+    _envelope,  # pyright: ignore[reportPrivateUsage]
     as_persisted_value,
+    decode_context,
+    decode_duration,
+    decode_id,
+    decode_kind,
+    decode_namespace,
     decode_persisted_value,
+    decode_ref,
+    decode_wall_instant,
+    encode_context,
+    encode_duration,
+    encode_id,
+    encode_kind,
+    encode_namespace,
     encode_persisted_value,
+    encode_ref,
+    encode_wall_instant,
 )
 
 
@@ -331,3 +351,238 @@ class TestCanonicalEncoding:
         ).encode("utf-8")
         with pytest.raises(ValueError):
             decode_persisted_value(malformed)
+
+
+class TestCorePrimitiveCodecs:
+    def test_cp_01_kind_round_trips(self) -> None:
+        kind = Kind("memory.test.subject")
+        assert decode_kind(encode_kind(kind)) == kind
+
+    def test_cp_02_id_round_trips(self) -> None:
+        value = Id(Kind("memory.test.subject"), "s1")
+        assert decode_id(encode_id(value)) == value
+
+    def test_cp_03_namespace_round_trips(self) -> None:
+        namespace = Namespace(("finance", "checking"))
+        assert decode_namespace(encode_namespace(namespace)) == namespace
+
+    def test_cp_04_ref_without_namespace_round_trips(self) -> None:
+        ref = Ref(id=Id(Kind("memory.test.subject"), "s1"))
+        decoded = decode_ref(encode_ref(ref))
+        assert decoded == ref
+        assert decoded.namespace is None
+
+    def test_cp_05_ref_with_namespace_preserves_it(self) -> None:
+        ref = Ref(
+            id=Id(Kind("memory.test.subject"), "s1"),
+            namespace=Namespace(("finance", "checking")),
+        )
+        decoded = decode_ref(encode_ref(ref))
+        assert decoded == ref
+        assert decoded.namespace == Namespace(("finance", "checking"))
+
+    def test_cp_06_wall_instant_persists_canonical_utc(self) -> None:
+        instant = WallInstant(datetime(2024, 1, 1, 12, 0, tzinfo=UTC))
+        assert decode_wall_instant(encode_wall_instant(instant)) == instant
+
+    def test_cp_07_duration_zero_round_trips(self) -> None:
+        duration = Duration(0)
+        assert decode_duration(encode_duration(duration)) == duration
+
+    def test_cp_08_very_large_duration_round_trips(self) -> None:
+        duration = Duration(2**200)
+        assert decode_duration(encode_duration(duration)) == duration
+
+    def test_cp_09_context_with_only_as_of_round_trips(self) -> None:
+        context = Context(as_of=WallInstant(datetime(2024, 1, 1, tzinfo=UTC)))
+        assert decode_context(encode_context(context)) == context
+
+    def test_cp_10_context_with_every_supported_field_round_trips(self) -> None:
+        context = Context(
+            as_of=WallInstant(datetime(2024, 1, 1, tzinfo=UTC)),
+            namespace=Namespace(("finance",)),
+            scope="checking",
+            environment="prod",
+            source="bank-api",
+            authority="user",
+            version="1",
+            units="usd",
+            metadata={"note": "test"},
+        )
+        assert decode_context(encode_context(context)) == context
+
+    def test_cp_11_context_metadata_order_yields_identical_bytes(self) -> None:
+        base = WallInstant(datetime(2024, 1, 1, tzinfo=UTC))
+        first = Context(as_of=base, metadata={"a": 1, "b": 2})
+        second = Context(as_of=base, metadata={"b": 2, "a": 1})
+        assert encode_context(first) == encode_context(second)
+
+    def test_cp_12_context_unsupported_object_fails_with_field_path(self) -> None:
+        class Exotic:
+            pass
+
+        context = Context(
+            as_of=WallInstant(datetime(2024, 1, 1, tzinfo=UTC)), scope=Exotic()
+        )
+        with pytest.raises(UnsupportedPersistedValue) as exc_info:
+            encode_context(context)
+        assert exc_info.value.path == ("scope",)
+
+    def test_cd_18_context_scope_as_id_is_rejected_in_v0(self) -> None:
+        context = Context(
+            as_of=WallInstant(datetime(2024, 1, 1, tzinfo=UTC)),
+            scope=Id(Kind("memory.test.subject"), "s1"),
+        )
+        with pytest.raises(UnsupportedPersistedValue):
+            encode_context(context)
+
+    def test_cp_13_decode_malformed_kind_fails_loudly(self) -> None:
+        with pytest.raises(ValueError):
+            decode_kind(b"not an envelope")
+
+    def test_cp_14_decode_unknown_tag_fails_loudly(self) -> None:
+        malformed = _envelope("memory.not_a_kind", 1, "x")
+        with pytest.raises(ValueError):
+            decode_kind(malformed)
+
+    def test_cp_15_encode_decode_encode_is_stable(self) -> None:
+        context = Context(
+            as_of=WallInstant(datetime(2024, 1, 1, tzinfo=UTC)),
+            metadata={"a": 1, "b": 2},
+        )
+        once = encode_context(context)
+        twice = encode_context(decode_context(once))
+        assert once == twice
+
+
+class TestCorePrimitiveCodecsMalformedPayloads:
+    """Regression tests: a well-formed envelope (right tag/version) whose
+    payload has the wrong shape must raise ValueError, never an incidental
+    TypeError/IndexError/AttributeError, mirroring the discipline already
+    established for _decode_node() in Task 3.
+    """
+
+    def test_decode_kind_non_string_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.kind", 1, 42)
+        with pytest.raises(ValueError):
+            decode_kind(malformed)
+
+    def test_decode_kind_null_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.kind", 1, None)
+        with pytest.raises(ValueError):
+            decode_kind(malformed)
+
+    def test_decode_id_non_list_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.id", 1, "not a list")
+        with pytest.raises(ValueError):
+            decode_id(malformed)
+
+    def test_decode_id_wrong_length_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.id", 1, ["memory.test.subject"])
+        with pytest.raises(ValueError):
+            decode_id(malformed)
+
+    def test_decode_id_non_string_element_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.id", 1, [42, "s1"])
+        with pytest.raises(ValueError):
+            decode_id(malformed)
+
+    def test_decode_namespace_non_list_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.namespace", 1, "finance")
+        with pytest.raises(ValueError):
+            decode_namespace(malformed)
+
+    def test_decode_namespace_non_string_segment_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.namespace", 1, [1, 2])
+        with pytest.raises(ValueError):
+            decode_namespace(malformed)
+
+    def test_decode_ref_wrong_shape_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.ref", 1, 42)
+        with pytest.raises(ValueError):
+            decode_ref(malformed)
+
+    def test_decode_ref_malformed_inner_id_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.ref", 1, [["only_kind"], None])
+        with pytest.raises(ValueError):
+            decode_ref(malformed)
+
+    def test_decode_ref_malformed_namespace_raises_valueerror(self) -> None:
+        malformed = _envelope(
+            "memory.ref", 1, [["memory.test.subject", "s1"], "not a list"]
+        )
+        with pytest.raises(ValueError):
+            decode_ref(malformed)
+
+    def test_decode_wall_instant_non_string_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.wall_instant", 1, 12345)
+        with pytest.raises(ValueError):
+            decode_wall_instant(malformed)
+
+    def test_decode_wall_instant_unparsable_string_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.wall_instant", 1, "not a timestamp")
+        with pytest.raises(ValueError):
+            decode_wall_instant(malformed)
+
+    def test_decode_duration_non_string_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.duration", 1, 42)
+        with pytest.raises(ValueError):
+            decode_duration(malformed)
+
+    def test_decode_duration_non_numeric_string_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.duration", 1, "not a number")
+        with pytest.raises(ValueError):
+            decode_duration(malformed)
+
+    def test_decode_context_non_dict_payload_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.context", 1, ["not", "a", "dict"])
+        with pytest.raises(ValueError):
+            decode_context(malformed)
+
+    def test_decode_context_missing_field_raises_valueerror(self) -> None:
+        malformed = _envelope("memory.context", 1, {"as_of": "2024-01-01T00:00:00+00:00"})
+        with pytest.raises(ValueError):
+            decode_context(malformed)
+
+    def test_decode_context_malformed_namespace_raises_valueerror(self) -> None:
+        malformed = _envelope(
+            "memory.context",
+            1,
+            {
+                "as_of": "2024-01-01T00:00:00+00:00",
+                "namespace": "not a list",
+                "scope": None,
+                "environment": None,
+                "source": None,
+                "authority": None,
+                "version": None,
+                "units": None,
+                "metadata": None,
+            },
+        )
+        with pytest.raises(ValueError):
+            decode_context(malformed)
+
+    def test_decode_context_non_mapping_metadata_raises_valueerror(self) -> None:
+        """A well-formed persisted-value node that decodes to a non-Mapping
+        (e.g. a plain string) must be rejected: Context.metadata requires a
+        Mapping, and this must fail as ValueError, not be passed through and
+        fail later with an incidental TypeError/AttributeError.
+        """
+        malformed = _envelope(
+            "memory.context",
+            1,
+            {
+                "as_of": "2024-01-01T00:00:00+00:00",
+                "namespace": None,
+                "scope": None,
+                "environment": None,
+                "source": None,
+                "authority": None,
+                "version": None,
+                "units": None,
+                "metadata": ["str", "not a mapping"],
+            },
+        )
+        with pytest.raises(ValueError):
+            decode_context(malformed)

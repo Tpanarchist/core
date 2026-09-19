@@ -10,8 +10,14 @@ import base64
 import json
 import math
 from collections.abc import Mapping
+from datetime import datetime
 from types import MappingProxyType
 from typing import cast
+
+from core.context import Context
+from core.identity import Id, Namespace, Ref
+from core.time import Duration, WallInstant
+from core.value import Kind
 
 type PersistedValue = (
     None
@@ -209,3 +215,178 @@ def encode_persisted_value(value: PersistedValue) -> bytes:
 
 def decode_persisted_value(data: bytes) -> PersistedValue:
     return _decode_node(_unenvelope("memory.persisted_value", 1, data))
+
+
+_CONTEXT_OBJECT_FIELDS = ("scope", "environment", "source", "authority", "version", "units")
+
+
+def _expect_list(payload: object, tag: str, *, length: int | None = None) -> list[object]:
+    """Validate that a decoded envelope/node payload is a list (optionally of
+    an exact length) before it is indexed or unpacked. ``payload`` comes from
+    parsed, but otherwise untrusted, external bytes — raises ``ValueError``
+    (never IndexError/TypeError) on anything malformed.
+    """
+    if not isinstance(payload, list):
+        raise ValueError(f"malformed {tag} payload: {payload!r}")
+    payload_list = cast(list[object], payload)
+    if length is not None and len(payload_list) != length:
+        raise ValueError(f"malformed {tag} payload: {payload!r}")
+    return payload_list
+
+
+def _expect_str(value: object, tag: str) -> str:
+    """Validate that a decoded payload element is a string before it is
+    passed to a constructor/parser that assumes ``str``.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"malformed {tag} payload: {value!r}")
+    return value
+
+
+def _expect_segments(payload: object, tag: str) -> tuple[str, ...]:
+    segments = _expect_list(payload, tag)
+    return tuple(_expect_str(segment, f"{tag} segment") for segment in segments)
+
+
+def _expect_dict(payload: object, tag: str) -> dict[str, object]:
+    if not isinstance(payload, dict):
+        raise ValueError(f"malformed {tag} payload: {payload!r}")
+    return cast(dict[str, object], payload)
+
+
+def _expect_key(payload: dict[str, object], key: str, tag: str) -> object:
+    if key not in payload:
+        raise ValueError(f"malformed {tag} payload: missing {key!r} field")
+    return payload[key]
+
+
+def _parse_iso_datetime(iso: str, tag: str) -> datetime:
+    try:
+        return datetime.fromisoformat(iso)
+    except ValueError as exc:
+        raise ValueError(f"malformed {tag} payload: {iso!r}") from exc
+
+
+def encode_kind(kind: Kind) -> bytes:
+    return _envelope("memory.kind", 1, kind.value)
+
+
+def decode_kind(data: bytes) -> Kind:
+    payload = _unenvelope("memory.kind", 1, data)
+    value = _expect_str(payload, "memory.kind")
+    return Kind(value)
+
+
+def encode_id(value: Id) -> bytes:
+    return _envelope("memory.id", 1, [value.kind.value, value.value])
+
+
+def decode_id(data: bytes) -> Id:
+    payload = _unenvelope("memory.id", 1, data)
+    pair = _expect_list(payload, "memory.id", length=2)
+    kind_value = _expect_str(pair[0], "memory.id.kind")
+    id_value = _expect_str(pair[1], "memory.id.value")
+    return Id(Kind(kind_value), id_value)
+
+
+def encode_namespace(namespace: Namespace) -> bytes:
+    return _envelope("memory.namespace", 1, list(namespace.segments))
+
+
+def decode_namespace(data: bytes) -> Namespace:
+    payload = _unenvelope("memory.namespace", 1, data)
+    return Namespace(_expect_segments(payload, "memory.namespace"))
+
+
+def encode_ref(ref: Ref) -> bytes:
+    namespace_segments = list(ref.namespace.segments) if ref.namespace is not None else None
+    payload = [[ref.id.kind.value, ref.id.value], namespace_segments]
+    return _envelope("memory.ref", 1, payload)
+
+
+def decode_ref(data: bytes) -> Ref:
+    payload = _unenvelope("memory.ref", 1, data)
+    outer = _expect_list(payload, "memory.ref", length=2)
+    id_pair = _expect_list(outer[0], "memory.ref.id", length=2)
+    kind_value = _expect_str(id_pair[0], "memory.ref.id.kind")
+    id_value = _expect_str(id_pair[1], "memory.ref.id.value")
+    namespace_segments = outer[1]
+    namespace = (
+        None
+        if namespace_segments is None
+        else Namespace(_expect_segments(namespace_segments, "memory.ref.namespace"))
+    )
+    return Ref(id=Id(Kind(kind_value), id_value), namespace=namespace)
+
+
+def encode_wall_instant(instant: WallInstant) -> bytes:
+    return _envelope("memory.wall_instant", 1, instant.value.isoformat())
+
+
+def decode_wall_instant(data: bytes) -> WallInstant:
+    payload = _unenvelope("memory.wall_instant", 1, data)
+    iso = _expect_str(payload, "memory.wall_instant")
+    return WallInstant(_parse_iso_datetime(iso, "memory.wall_instant"))
+
+
+def encode_duration(duration: Duration) -> bytes:
+    return _envelope("memory.duration", 1, str(duration.nanoseconds))
+
+
+def decode_duration(data: bytes) -> Duration:
+    payload = _unenvelope("memory.duration", 1, data)
+    raw = _expect_str(payload, "memory.duration")
+    try:
+        nanoseconds = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"malformed memory.duration payload: {raw!r}") from exc
+    return Duration(nanoseconds)
+
+
+def encode_context(context: Context) -> bytes:
+    payload: dict[str, object] = {
+        "as_of": context.as_of.value.isoformat(),
+        "namespace": list(context.namespace.segments) if context.namespace is not None else None,
+    }
+    for field in _CONTEXT_OBJECT_FIELDS:
+        raw = getattr(context, field)
+        payload[field] = (
+            None if raw is None else _encode_node(as_persisted_value(raw, path=(field,)))
+        )
+    payload["metadata"] = (
+        None
+        if context.metadata is None
+        else _encode_node(as_persisted_value(context.metadata, path=("metadata",)))
+    )
+    return _envelope("memory.context", 1, payload)
+
+
+def decode_context(data: bytes) -> Context:
+    payload = _unenvelope("memory.context", 1, data)
+    payload_dict = _expect_dict(payload, "memory.context")
+
+    as_of_raw = _expect_key(payload_dict, "as_of", "memory.context")
+    as_of_iso = _expect_str(as_of_raw, "memory.context.as_of")
+    as_of = WallInstant(_parse_iso_datetime(as_of_iso, "memory.context.as_of"))
+
+    namespace_raw = _expect_key(payload_dict, "namespace", "memory.context")
+    namespace = (
+        None
+        if namespace_raw is None
+        else Namespace(_expect_segments(namespace_raw, "memory.context.namespace"))
+    )
+
+    fields: dict[str, object] = {}
+    for field in _CONTEXT_OBJECT_FIELDS:
+        node = _expect_key(payload_dict, field, "memory.context")
+        fields[field] = None if node is None else _decode_node(node)
+
+    metadata_node = _expect_key(payload_dict, "metadata", "memory.context")
+    metadata: Mapping[str, object] | None = None
+    if metadata_node is not None:
+        decoded_metadata = _decode_node(metadata_node)
+        if not isinstance(decoded_metadata, Mapping):
+            raise ValueError(f"malformed memory.context.metadata payload: {metadata_node!r}")
+        metadata = decoded_metadata
+
+    return Context(as_of=as_of, namespace=namespace, metadata=metadata, **fields)
