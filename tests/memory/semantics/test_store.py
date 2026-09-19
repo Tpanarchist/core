@@ -12,7 +12,7 @@ import pytest
 from _memory_side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
-from core.epistemic import Claim, Contradiction, Inference
+from core.epistemic import Claim, Contradiction, Inference, Resolution
 from core.error import Error
 from core.event import Event
 from core.identity import Id, Namespace, Ref
@@ -471,3 +471,162 @@ class TestEmbeddedEntities:
         with pytest.raises(UnsupportedPersistedValue):
             store.persist(error)
         assert store.resolve(error.id) is None
+
+
+class TestClaimsFor:
+    def test_matches_by_subject_and_predicate(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        store.persist(claim)
+        assert store.claims_for(SUBJECT, Kind("memory.test.p")) == (claim,)
+
+    def test_ref_subject_matches_via_identity_of(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        store.persist(claim)
+        result = store.claims_for(
+            Ref(id=SUBJECT, namespace=Namespace(("finance",))), Kind("memory.test.p")
+        )
+        assert result == (claim,)
+
+    def test_different_predicate_excluded(self) -> None:
+        store = InMemoryStore()
+        store.persist(make_claim("c1"))
+        assert store.claims_for(SUBJECT, Kind("memory.test.other_predicate")) == ()
+
+    def test_claims_for_performs_no_context_filtering(self) -> None:
+        # Critical rule: claims_for() never filters by Context — belief_state()
+        # needs the full unfiltered slot to correctly determine conflict
+        # relevance before its own Context filtering.
+        store = InMemoryStore()
+        incompatible_context = Context(as_of=WallInstant(datetime(2024, 6, 1, tzinfo=UTC)))
+        claim: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "c1"), subject=SUBJECT, predicate=Kind("memory.test.p"),
+            value=Known("x"), context=incompatible_context, asserted_by=AGENT,
+            evidence_refs=(), at=AT,
+        )
+        store.persist(claim)
+        assert store.claims_for(SUBJECT, Kind("memory.test.p")) == (claim,)
+
+    def test_persistence_order_preserved(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        c2: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "c2"), subject=SUBJECT, predicate=Kind("memory.test.p"),
+            value=Known("y"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(c2)
+        store.persist(c1)
+        assert store.claims_for(SUBJECT, Kind("memory.test.p")) == (c2, c1)
+
+    def test_idempotent_retry_does_not_duplicate(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        store.persist(claim)
+        store.persist(claim)
+        assert store.claims_for(SUBJECT, Kind("memory.test.p")) == (claim,)
+
+    def test_inference_embedded_conclusion_appears_exactly_once(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        inference = Inference(
+            id=Id(Kind("memory.test.inference"), "i1"), premises=(),
+            method=Kind("memory.test.m"), conclusion=claim, at=AT,
+        )
+        store.persist(inference)
+        assert store.claims_for(SUBJECT, Kind("memory.test.p")) == (claim,)
+
+
+class TestConflictsFor:
+    def _contradiction(
+        self, statements: tuple[Ref, ...], contra_id: str = "k1", subject: Id | Ref = SUBJECT
+    ) -> Contradiction:
+        return Contradiction(
+            id=Id(CONTRA_KIND, contra_id), subject=subject, statements=statements,
+            detected_at=AT, context=CTX,
+        )
+
+    def test_cl_01_subject_mismatch_excluded(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        store.persist(c1)
+        other_subject_contradiction = self._contradiction(
+            (Ref(id=c1.id), Ref(id=Id(CLAIM_KIND, "other"))), subject=Id(SUBJECT_KIND, "different"),
+        )
+        store.persist(other_subject_contradiction)
+        assert store.conflicts_for(SUBJECT, Kind("memory.test.p")) == ()
+
+    def test_cl_02_no_slot_statement_excluded(self) -> None:
+        store = InMemoryStore()
+        contradiction = self._contradiction(
+            (Ref(id=Id(CLAIM_KIND, "gone1")), Ref(id=Id(CLAIM_KIND, "gone2")))
+        )
+        store.persist(contradiction)
+        assert store.conflicts_for(SUBJECT, Kind("memory.test.p")) == ()
+
+    def test_cl_03_one_slot_statement_sufficient(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        store.persist(c1)
+        contradiction = self._contradiction((Ref(id=c1.id), Ref(id=Id(CLAIM_KIND, "gone"))))
+        store.persist(contradiction)
+        assert contradiction in store.conflicts_for(SUBJECT, Kind("memory.test.p"))
+
+    def test_cl_07_ref_statement_namespace_does_not_break_identity_match(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        store.persist(c1)
+        namespaced_statement = Ref(id=c1.id, namespace=Namespace(("some", "ns")))
+        contradiction = self._contradiction((namespaced_statement, Ref(id=Id(CLAIM_KIND, "other"))))
+        store.persist(contradiction)
+        assert contradiction in store.conflicts_for(SUBJECT, Kind("memory.test.p"))
+
+    def test_cl_08_resolution_follows_relevant_contradiction(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        c2 = make_claim("c2")
+        store.persist(c1)
+        store.persist(c2)
+        contradiction = self._contradiction((Ref(id=c1.id), Ref(id=c2.id)))
+        store.persist(contradiction)
+        resolution = Resolution(
+            contradiction=Ref(id=contradiction.id), rationale="r", resolved_by=AGENT, at=AT
+        )
+        store.persist(resolution)
+        result = store.conflicts_for(SUBJECT, Kind("memory.test.p"))
+        assert result == (contradiction, resolution)
+
+    def test_cl_09_multiple_resolutions_preserve_append_order(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        store.persist(c1)
+        contradiction = self._contradiction((Ref(id=c1.id), Ref(id=Id(CLAIM_KIND, "other"))))
+        store.persist(contradiction)
+        r1 = Resolution(
+            contradiction=Ref(id=contradiction.id), rationale="first", resolved_by=AGENT, at=AT
+        )
+        r2 = Resolution(
+            contradiction=Ref(id=contradiction.id), rationale="second", resolved_by=AGENT, at=AT
+        )
+        store.persist(r1)
+        store.persist(r2)
+        assert store.conflicts_for(SUBJECT, Kind("memory.test.p")) == (contradiction, r1, r2)
+
+    def test_resolution_before_contradiction_raises(self) -> None:
+        store = InMemoryStore()
+        orphan_resolution = Resolution(
+            contradiction=Ref(id=Id(CONTRA_KIND, "never-persisted")), rationale="r",
+            resolved_by=AGENT, at=AT,
+        )
+        with pytest.raises(ValueError, match="not recorded"):
+            store.persist(orphan_resolution)
+
+    def test_idempotent_contradiction_retry_does_not_duplicate_conflict_history(self) -> None:
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        store.persist(c1)
+        contradiction = self._contradiction((Ref(id=c1.id), Ref(id=Id(CLAIM_KIND, "other"))))
+        store.persist(contradiction)
+        store.persist(contradiction)
+        result = store.conflicts_for(SUBJECT, Kind("memory.test.p"))
+        assert result.count(contradiction) == 1

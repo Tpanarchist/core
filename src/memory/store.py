@@ -20,11 +20,11 @@ from core.effect import Effect
 from core.epistemic import Claim, Contradiction, Inference, Resolution
 from core.error import Error
 from core.event import Event
-from core.identity import Id, Ref
+from core.identity import Id, Ref, identity_of
 from core.observation import Observation
 from core.provenance import Provenance
 from core.time import WallInstant
-from core.value import Known, Unknown
+from core.value import Kind, Known, Unknown
 from memory.codec import (
     UnsupportedPersistedValue,
     as_persisted_value,
@@ -438,8 +438,9 @@ class InMemoryStore:
         action = self._check(stored.id, canonical, type(record))
         if action == "insert":
             self._commit(stored.id, stored, canonical)
-            # NOTE(Task 3): Contradiction persistence must also append to
-            # self._conflict_entries/_conflict_ids here.
+            if isinstance(stored, Contradiction):
+                self._conflict_entries.append(stored)
+                self._conflict_ids.add(stored.id)
 
     def _persist_inference(self, inference: Inference[object]) -> None:
         stored_claim = self._snapshot_claim(inference.conclusion)
@@ -509,3 +510,37 @@ class InMemoryStore:
         if isinstance(stored, Episode):
             return self._snapshot_episode(stored)
         return stored
+
+    def claims_for(self, subject: Id | Ref, predicate: Kind) -> tuple[Claim[object], ...]:
+        subject_id = identity_of(subject)
+        result: list[Claim[object]] = []
+        for entity_id in self._entity_order:
+            entity = self._entities[entity_id]
+            if (
+                isinstance(entity, Claim)
+                and identity_of(entity.subject) == subject_id
+                and entity.predicate == predicate
+            ):
+                result.append(entity)
+        return tuple(result)
+
+    def conflicts_for(
+        self, subject: Id | Ref, predicate: Kind
+    ) -> tuple[Contradiction | Resolution, ...]:
+        slot_claim_ids = {claim.id for claim in self.claims_for(subject, predicate)}
+        subject_id = identity_of(subject)
+        result: list[Contradiction | Resolution] = []
+        relevant_ids: set[Id] = set()
+        for entry in self._conflict_entries:
+            if isinstance(entry, Contradiction):
+                if identity_of(entry.subject) != subject_id:
+                    continue
+                if not any(
+                    identity_of(statement) in slot_claim_ids for statement in entry.statements
+                ):
+                    continue
+                relevant_ids.add(entry.id)
+                result.append(entry)
+            elif entry.contradiction.id in relevant_ids:
+                result.append(entry)
+        return tuple(result)
