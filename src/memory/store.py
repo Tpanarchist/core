@@ -459,13 +459,19 @@ class InMemoryStore:
             self._commit(inference.id, stored_inference, inference_canonical)
 
     def _persist_error(self, error: Error) -> None:
-        if error.exception is not None:
-            raise UnsupportedPersistedValue(
-                (), error.exception, "foreign exceptions are not persistable"
-            )
         chain: list[Error] = []
         current: Error | None = error
         while current is not None:
+            # Every Error in the cause chain is independently persisted
+            # (§6), so every Error in the chain is independently subject to
+            # §7's foreign-exception ban — not just the top-level Error.
+            # Checked before any snapshotting/canonicalization begins so a
+            # foreign exception nested in .cause fails the whole operation
+            # atomically (§8), never partially registering an ancestor.
+            if current.exception is not None:
+                raise UnsupportedPersistedValue(
+                    (), current.exception, "foreign exceptions are not persistable"
+                )
             chain.append(current)
             current = current.cause
         chain.reverse()  # root cause first

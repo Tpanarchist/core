@@ -244,6 +244,22 @@ class TestPersistBasicEntities:
         store = InMemoryStore()
         assert store.resolve(Id(Kind("memory.test.missing"), "x")) is None
 
+    def test_pa_07_unsupported_nested_payload_propagates_codec_error(self) -> None:
+        from core.observation import Observation
+        from memory.codec import UnsupportedPersistedValue
+
+        class NotPersistable:
+            pass
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value=NotPersistable(),
+            at=AT, source="s", context=CTX,
+        )
+        with pytest.raises(UnsupportedPersistedValue):
+            store.persist(obs)
+        assert store.resolve(obs.id) is None
+
 
 class TestIdentityCollision:
     def test_id_01_first_insertion_succeeds(self) -> None:
@@ -478,6 +494,33 @@ class TestEmbeddedEntities:
             store.persist(error)
         assert store.resolve(error.id) is None
 
+    def test_persist_error_with_foreign_exception_on_nested_cause_rejected_no_partial_write(
+        self,
+    ) -> None:
+        # Regression: §7's foreign-exception ban applies to every Error in
+        # the cause chain (§6 says each cause is independently registered),
+        # not only the top-level Error passed to persist(). Previously
+        # _persist_error() checked only the top-level `error.exception`,
+        # so a foreign exception embedded on a nested .cause was never
+        # validated: it silently passed through dataclasses.replace() (which
+        # preserves untouched fields, .exception included) and got committed
+        # into the store unvalidated, violating both §7 and the "no
+        # partial/unsupported write" atomicity guarantee.
+        from memory.codec import UnsupportedPersistedValue
+
+        store = InMemoryStore()
+        root = Error(
+            id=Id(ERROR_KIND, "root"), kind=ERROR_KIND, message="root", at=AT,
+            exception=ValueError("boom-in-cause"),
+        )
+        wrapping = Error(
+            id=Id(ERROR_KIND, "wrap"), kind=ERROR_KIND, message="wrap", at=AT, cause=root
+        )
+        with pytest.raises(UnsupportedPersistedValue):
+            store.persist(wrapping)
+        assert store.resolve(root.id) is None
+        assert store.resolve(wrapping.id) is None
+
 
 class TestClaimsFor:
     def test_matches_by_subject_and_predicate(self) -> None:
@@ -618,6 +661,52 @@ class TestConflictsFor:
         store.persist(r2)
         assert store.conflicts_for(SUBJECT, Kind("memory.test.p")) == (contradiction, r1, r2)
 
+    def test_cl_04_cross_predicate_contradiction_still_relevant(self) -> None:
+        # Unlike CL-03/CL-06 (where the other statement is simply missing),
+        # here the other statement resolves to a real, existing Claim under
+        # a *different* predicate. The contradiction must still be included
+        # because the requested-slot Claim (owner_claim) participates —
+        # conflicts_for() must not be fooled into excluding it just because
+        # the other statement's Claim exists but sits in a different slot.
+        store = InMemoryStore()
+        owner_claim: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "owner"), subject=SUBJECT, predicate=Kind("memory.test.owner"),
+            value=Known("alice"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        legal_claim: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "legal"), subject=SUBJECT, predicate=Kind("memory.test.legal"),
+            value=Known("bob"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(owner_claim)
+        store.persist(legal_claim)
+        contradiction = self._contradiction((Ref(id=owner_claim.id), Ref(id=legal_claim.id)))
+        store.persist(contradiction)
+        assert contradiction in store.conflicts_for(SUBJECT, Kind("memory.test.owner"))
+
+    def test_cl_10_resolution_rationale_never_parsed(self) -> None:
+        # rationale is opaque text, even when it looks machine-readable
+        # (e.g. names another real Contradiction's Id) — the store must
+        # never act on its content.
+        store = InMemoryStore()
+        c1 = make_claim("c1")
+        store.persist(c1)
+        contradiction = self._contradiction((Ref(id=c1.id), Ref(id=Id(CLAIM_KIND, "other"))))
+        store.persist(contradiction)
+        other_contradiction = self._contradiction(
+            (Ref(id=Id(CLAIM_KIND, "x")), Ref(id=Id(CLAIM_KIND, "y"))),
+            contra_id="k2", subject=Id(SUBJECT_KIND, "unrelated"),
+        )
+        store.persist(other_contradiction)
+        resolution = Resolution(
+            contradiction=Ref(id=contradiction.id),
+            rationale=f"see also contradiction {other_contradiction.id!r} which wins",
+            resolved_by=AGENT, at=AT,
+        )
+        store.persist(resolution)
+        result = store.conflicts_for(SUBJECT, Kind("memory.test.p"))
+        assert result == (contradiction, resolution)
+        assert other_contradiction not in result
+
     def test_resolution_before_contradiction_raises(self) -> None:
         store = InMemoryStore()
         orphan_resolution = Resolution(
@@ -674,6 +763,35 @@ class TestRetentionFor:
         store.persist(mark)
         assert store.retention_for(Ref(id=target, namespace=Namespace(("ledger",)))) == (mark,)
 
+    def test_retention_for_returns_custom_accessibility_mark_normally(self) -> None:
+        # A non-standard accessibility Kind fails default *retrieval*
+        # (matrix RR-06), but retention_for() itself is a raw accessor with
+        # no accessibility interpretation — it must return the mark as-is,
+        # never raise.
+        store = InMemoryStore()
+        target = Id(Kind("memory.test.item"), "x")
+        custom = Kind("memory.retention.legal_hold")
+        mark = RetentionMark(item=Ref(id=target), accessibility=custom, at=AT)
+        store.persist(mark)
+        assert store.retention_for(target) == (mark,)
+
+    def test_archived_entity_still_resolves_exactly(self) -> None:
+        # resolve() performs exact structural access and bypasses retention
+        # accessibility entirely (prereg §16/§31): an ARCHIVED entity
+        # remains resolvable exactly, even though it is excluded from
+        # default retrieve().
+        from core.observation import Observation
+        from memory.retention import ARCHIVED
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+        assert store.resolve(obs.id) == obs
+
 
 class TestEpisodeStoreSurface:
     def test_create_empty_open_episode(self) -> None:
@@ -727,6 +845,19 @@ class TestEpisodeStoreSurface:
         resolved = store.resolve(episode_id)
         assert isinstance(resolved, Episode)
         assert resolved.items() == (ref_a, ref_b, ref_a)
+
+    def test_append_self_ref_valid(self) -> None:
+        # Self-reference and cycles remain opaque and valid (prereg §21):
+        # append_episode() never follows/dereferences the appended Ref, so
+        # an Episode may append a Ref pointing at its own Id.
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        self_ref = Ref(id=episode_id)
+        store.append_episode(episode_id, self_ref)
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (self_ref,)
 
     def test_append_to_missing_episode_raises_keyerror(self) -> None:
         store = InMemoryStore()
@@ -819,6 +950,19 @@ class TestLexicalContent:
         )
         assert lexical_content(obs) == ()
 
+    def test_observation_nested_mapping_string_not_recursively_searchable(self) -> None:
+        # source/observer must be non-str here too (as in
+        # test_observation_int_value_not_searchable above), or this would
+        # not actually isolate whether `value`'s nested mapping is
+        # recursively searched.
+        from core.observation import Observation
+
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value={"k": "findme"},
+            at=AT, source=7, context=CTX,
+        )
+        assert lexical_content(obs) == ()
+
     def test_claim_known_str_searchable_unknown_not(self) -> None:
         known = make_claim("c1", value="findme")
         assert "findme" in lexical_content(known)
@@ -845,6 +989,15 @@ class TestLexicalContent:
         assert "did a thing" in content
         assert "str target" in content
 
+    def test_effect_nested_metadata_not_recursively_searchable(self) -> None:
+        from core.effect import Effect
+
+        effect = Effect(
+            id=Id(Kind("memory.test.effect"), "f1"), kind=Kind("memory.test.k"),
+            description="d", target="t", at=AT, metadata={"m": "findme"},
+        )
+        assert "findme" not in lexical_content(effect)
+
     def test_error_message_and_operation_searchable(self) -> None:
         error = Error(
             id=Id(ERROR_KIND, "err1"), kind=ERROR_KIND, message="failed hard",
@@ -853,6 +1006,13 @@ class TestLexicalContent:
         content = lexical_content(error)
         assert "failed hard" in content
         assert "do-thing" in content
+
+    def test_error_metadata_not_recursively_searchable(self) -> None:
+        error = Error(
+            id=Id(ERROR_KIND, "err1"), kind=ERROR_KIND, message="m", at=AT,
+            metadata={"m": "findme"},
+        )
+        assert "findme" not in lexical_content(error)
 
     def test_provenance_transform_name_and_version_searchable(self) -> None:
         from core.provenance import Provenance
@@ -998,6 +1158,40 @@ class TestRetrieve:
         candidates = store.retrieve(RetrievalQuery(context=CTX, text="shared"), retrieved_at=AT)
         assert len(candidates) == 50
 
+    def test_substring_match_not_aligned_to_token_boundary(self) -> None:
+        # Lexical contract: literal substring matching, not token-only — a
+        # query that is only a mid-word fragment (not aligned to any word
+        # boundary) must still match.
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="World",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        assert len(store.retrieve(RetrievalQuery(context=CTX, text="orl"), retrieved_at=AT)) == 1
+
+    def test_no_unicode_normalization(self) -> None:
+        # Lexical contract: no Unicode normalization — an NFD-composed query
+        # must not match an NFC-composed stored value (or vice versa), since
+        # matching is literal code-point substring comparison.
+        import unicodedata
+
+        from core.observation import Observation
+
+        nfc = unicodedata.normalize("NFC", "café")
+        nfd = unicodedata.normalize("NFD", "café")
+        assert nfc != nfd  # sanity: genuinely different code point sequences
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value=nfc,
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        assert store.retrieve(RetrievalQuery(context=CTX, text=nfd), retrieved_at=AT) == ()
+        assert len(store.retrieve(RetrievalQuery(context=CTX, text=nfc), retrieved_at=AT)) == 1
+
 
 class TestRetrievalRetention:
     def test_rr_01_active_eligible_by_default(self) -> None:
@@ -1063,6 +1257,28 @@ class TestRetrievalRetention:
         candidates = store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
         assert [c.item.id for c in candidates] == [active_obs.id, deprioritized_obs.id]
 
+    def test_append_order_beats_timestamp_for_current_accessibility(self) -> None:
+        # "Current" accessibility is a projection over append order, never
+        # sorted by RetentionMark.at (prereg §15/§30) — even when timestamps
+        # disagree with append order, the append-order-latest mark wins.
+        from core.observation import Observation
+        from memory.retention import ACTIVE, ARCHIVED
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        later = WallInstant(datetime(2025, 1, 1, tzinfo=UTC))
+        # Appended first (ACTIVE) but stamped with a LATER timestamp than
+        # the mark appended second (ARCHIVED, stamped EARLIER).
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ACTIVE, at=later))
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+        # Append order says ARCHIVED is current (appended last), despite its
+        # earlier timestamp.
+        assert store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT) == ()
+
     def test_custom_accessibility_kind_raises_on_default_retrieval(self) -> None:
         from core.observation import Observation
 
@@ -1103,3 +1319,20 @@ class TestNoGenericEnumerationOrDelete:
         store = InMemoryStore()
         for name in forbidden:
             assert not hasattr(store, name), f"InMemoryStore must not expose {name}()"
+
+    def test_pa_09_10_11_public_surface_matches_protocol_exactly(self) -> None:
+        # PA-09/PA-10/PA-11: a non-Entity record's internal storage position
+        # (list index / local sequence used to order Resolution/
+        # RetentionMark) must never become part of any exposed identity,
+        # gain a Core Id, or be reachable through a Ref-construction API.
+        # The check above only denies a fixed list of forbidden names;
+        # this proves there is genuinely no OTHER public method at all
+        # beyond the frozen MemoryStore protocol through which such a
+        # position could leak out.
+        store = InMemoryStore()
+        public_attrs = {name for name in dir(store) if not name.startswith("_")}
+        protocol_methods = {
+            "persist", "resolve", "retrieve", "claims_for", "conflicts_for",
+            "retention_for", "create_episode", "append_episode", "close_episode",
+        }
+        assert public_attrs == protocol_methods
