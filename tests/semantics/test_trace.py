@@ -9,7 +9,7 @@ import pytest
 from _side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
-from core.identity import Id, Ref
+from core.identity import Entity, Id, Ref
 from core.time import Sequence, WallInstant
 from core.trace import Trace
 from core.value import Kind
@@ -24,6 +24,9 @@ def make_trace(suffix: str = "t1") -> Trace:
 
 
 class TestTraceIdentity:
+    def test_satisfies_entity(self) -> None:
+        assert isinstance(make_trace(), Entity)
+
     def test_id_is_stable_and_read_only(self) -> None:
         trace = make_trace()
         original_id = trace.id

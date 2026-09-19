@@ -10,7 +10,7 @@ from _side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
 from core.error import Error
-from core.identity import Id
+from core.identity import Entity, Id
 from core.time import WallInstant
 from core.value import Kind
 
@@ -34,6 +34,9 @@ class TestConstruction:
     def test_requires_id_and_at(self) -> None:
         with pytest.raises(TypeError):
             Error(kind=KIND, message="boom")  # type: ignore[call-arg]
+
+    def test_satisfies_entity(self) -> None:
+        assert isinstance(make_error(), Entity)
 
     def test_rejects_empty_message(self) -> None:
         with pytest.raises(ValueError, match="message must not be empty"):

@@ -12,7 +12,7 @@ from _side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
 from core.effect import EffectSpec
-from core.identity import Id, Ref
+from core.identity import Entity, Id, Ref
 from core.provenance import Provenance, Traced
 from core.result import Err, Ok
 from core.time import Duration, MonotonicInstant, WallInstant
@@ -116,6 +116,13 @@ class TestTransformConstruction:
 
         make_transform(fn=fn, requires=(req,))
         assert calls == []
+
+    def test_satisfies_entity(self) -> None:
+        # Carries an Id for Provenance to cite; not currently a Ref target —
+        # valid because Ref-target => Entity => Id is one-directional, and a
+        # type may earn an Id (and structurally satisfy Entity) without being
+        # a Ref target.
+        assert isinstance(make_transform(), Entity)
 
     def test_equality_is_by_id_not_callables(self) -> None:
         id_ = Id(TRANSFORM_ID_KIND, "t1")
