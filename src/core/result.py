@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Never
 
 
 class UnwrapError(Exception):
@@ -62,7 +62,7 @@ class Err[E]:
     def and_then(self, fn: Callable[[Any], Any]) -> Err[E]:
         return self
 
-    def unwrap(self) -> Any:
+    def unwrap(self) -> Never:
         raise UnwrapError(self.error)
 
     def unwrap_or[T](self, default: T) -> T:

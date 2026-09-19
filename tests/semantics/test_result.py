@@ -1,8 +1,10 @@
 """Propositions for core.result — see SPECIFICATION.md #8 and docs/passes/01-atoms.md."""
 
+from typing import assert_type
+
 import pytest
 
-from core.result import Err, Ok, UnwrapError
+from core.result import Err, Ok, Result, UnwrapError
 
 
 class TestBranchExclusivity:
@@ -93,6 +95,19 @@ class TestUnwrap:
 
     def test_err_unwrap_or_returns_default(self) -> None:
         assert Err("boom").unwrap_or(99) == 99
+
+
+class TestUnwrapType:
+    def test_unwrap_type_is_not_widened_to_any(self) -> None:
+        # Err.unwrap() is typed -> Never (it always raises), so a statically
+        # typed Result[int, str].unwrap() resolves to plain `int`, not `Any` —
+        # if Err.unwrap() ever regresses back to `Any`, pyright fails this.
+        def make(flag: bool) -> Result[int, str]:
+            return Ok(1) if flag else Err("boom")
+
+        result = make(True)
+        assert_type(result.unwrap(), int)
+        assert result.unwrap() == 1
 
 
 class TestComposition:
