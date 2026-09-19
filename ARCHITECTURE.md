@@ -75,10 +75,10 @@ from core.result import Ok, Err
 | 4 | `provenance` | `Provenance`, `Traced`, `AncestorReport` | `identity`, `time`, `context` |
 | 4 | `epistemic` | `Claim`, `Inference`, `Contradiction`, `Resolution`, `ContradictionLog` | `value`, `identity`, `time`, `context` |
 | 5 | `state` | `State`, `Transition`, `History` | `identity`, `time`, `context`, `event` |
-| 5 | `constraint` | `require`, `ensure`, `invariant`, `ContractError` | `context`, `error`, `identity`, `time` |
-| 6 | `transform` | `Transform`, `Pipeline` | `identity`, `time`, `context`, `result`, `error`, `effect`, `provenance` |
+| 5 | `constraint` | `require`, `ensure`, `invariant`, `ContractError` | `value`, `context`, `error`, `identity`, `time` |
+| 6 | `transform` | `Transform`, `Pipeline` | `value`, `identity`, `time`, `context`, `result`, `error`, `effect`, `provenance` |
 
-`constraint`'s row includes `identity`/`time` beyond `{context, error}` — `require`/`ensure`/`invariant` need an `IdSource`/`Clock` parameter to construct a violation's `Error.id`/`Error.at` explicitly, exactly like `Transform.apply()` does, rather than allocating them silently.
+`constraint`'s row includes `identity`/`time` beyond `{context, error}` — `require`/`ensure`/`invariant` need an `IdSource`/`Clock` parameter to construct a violation's `Error.id`/`Error.at` explicitly, exactly like `Transform.apply()` does, rather than allocating them silently. Both `constraint` and `transform` also depend directly on `value`: each constructs canonical `Kind` values of its own (a constraint-violation classification and an Error identity kind for `constraint`; Transform-failure classifications and Error/Provenance identity kinds for `transform`). Importing `Kind` indirectly through a module that merely happens to import `core.value` would violate the "one concept, one obvious home" rule — `Kind` lives in `value.py`, so anything that constructs one depends on `value` directly.
 
 What's notably **absent** is as important as what's present: `trace` does not import `event`, `effect`, `provenance`, or `state`. `provenance` does not import `transform`. `epistemic` does not import `observation` (its evidence is by `Ref`). `context` does not import contradiction machinery. `identity` knows almost nothing.
 
