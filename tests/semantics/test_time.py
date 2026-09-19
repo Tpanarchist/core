@@ -1,12 +1,10 @@
 """Propositions for core.time — see SPECIFICATION.md #4 and docs/passes/02-identity-time.md."""
 
-import importlib
 from datetime import UTC, datetime, timedelta, timezone
-from unittest import mock
 
 import pytest
+from _side_effects import assert_fresh_import_has_no_side_effects
 
-import core.time as core_time
 from core.identity import Id
 from core.time import (
     Duration,
@@ -221,14 +219,9 @@ class TestMonotonicDeadline:
 
 def test_importing_time_module_has_no_side_effects() -> None:
     # datetime.datetime is an immutable C type — .now can't be patched via
-    # setattr, and reload() re-runs `from datetime import datetime`, which
-    # would rebind any module-local patch anyway. Reading the module confirms
-    # no top-level call to datetime.now() exists; the monotonic-clock check
-    # below is the mechanically enforceable half of this proposition. Pass 6's
+    # setattr, in-process or in a subprocess. Reading the module confirms no
+    # top-level call to datetime.now() exists; the monotonic-clock check here
+    # is the mechanically enforceable half of this proposition. Pass 6's
     # architecture-wide import-side-effect test covers wall-clock reads too,
     # via a mechanism that doesn't depend on patching an immutable type.
-    with mock.patch(
-        "time.monotonic_ns",
-        side_effect=AssertionError("import must not read the monotonic clock"),
-    ):
-        importlib.reload(core_time)
+    assert_fresh_import_has_no_side_effects("core.time", ("time.monotonic_ns",))

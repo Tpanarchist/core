@@ -6,6 +6,7 @@ See SPECIFICATION.md #9 and docs/passes/03-context-error-trace.md.
 from datetime import UTC, datetime
 
 import pytest
+from _side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
 from core.error import Error
@@ -98,10 +99,4 @@ def test_error_is_not_an_exception_subclass() -> None:
 
 
 def test_importing_error_module_has_no_side_effects() -> None:
-    import importlib
-    from unittest import mock
-
-    import core.error as core_error
-
-    with mock.patch("uuid.uuid4", side_effect=AssertionError("import must not allocate an id")):
-        importlib.reload(core_error)
+    assert_fresh_import_has_no_side_effects("core.error", ("uuid.uuid4",))

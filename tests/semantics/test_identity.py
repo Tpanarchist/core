@@ -1,13 +1,11 @@
 """Propositions for core.identity — see SPECIFICATION.md #1 and docs/passes/02-identity-time.md."""
 
-import importlib
 import uuid
 from dataclasses import dataclass
-from unittest import mock
 
 import pytest
+from _side_effects import assert_fresh_import_has_no_side_effects
 
-import core.identity as core_identity
 from core.identity import Entity, Id, Key, Namespace, Ref, UuidIdSource, identity_of
 from core.value import Kind
 
@@ -123,7 +121,4 @@ class TestUuidIdSource:
 
 
 def test_importing_identity_module_has_no_side_effects() -> None:
-    with mock.patch(
-        "uuid.uuid4", side_effect=AssertionError("import must not allocate a UUID")
-    ):
-        importlib.reload(core_identity)
+    assert_fresh_import_has_no_side_effects("core.identity", ("uuid.uuid4",))

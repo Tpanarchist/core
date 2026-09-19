@@ -6,6 +6,7 @@ See SPECIFICATION.md #16 and docs/passes/03-context-error-trace.md.
 from datetime import UTC, datetime
 
 import pytest
+from _side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
 from core.identity import Id, Ref
@@ -122,10 +123,4 @@ class TestSince:
 
 
 def test_importing_trace_module_has_no_side_effects() -> None:
-    import importlib
-    from unittest import mock
-
-    import core.trace as core_trace
-
-    with mock.patch("uuid.uuid4", side_effect=AssertionError("import must not allocate an id")):
-        importlib.reload(core_trace)
+    assert_fresh_import_has_no_side_effects("core.trace", ("uuid.uuid4",))

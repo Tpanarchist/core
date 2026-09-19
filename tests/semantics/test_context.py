@@ -6,6 +6,7 @@ See SPECIFICATION.md #3 and docs/passes/03-context-error-trace.md.
 from datetime import UTC, datetime
 
 import pytest
+from _side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context, ContextConflict
 from core.result import Err, Ok
@@ -179,10 +180,4 @@ def test_context_has_no_knowledge_of_contradiction() -> None:
 
 
 def test_importing_context_module_has_no_side_effects() -> None:
-    import importlib
-    from unittest import mock
-
-    import core.context as core_context
-
-    with mock.patch("uuid.uuid4", side_effect=AssertionError("import must not allocate an id")):
-        importlib.reload(core_context)
+    assert_fresh_import_has_no_side_effects("core.context", ("uuid.uuid4",))
