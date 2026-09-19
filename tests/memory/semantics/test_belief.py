@@ -242,6 +242,42 @@ class TestContextAndTime:
         )
         assert claim not in result.candidates
 
+    def test_ct_03_optional_context_field_populated_one_side_fills_in(self) -> None:
+        # Claim's context has `source` populated; query leaves it None —
+        # Context.merge() fills in from the non-None side, so they're compatible.
+        claim = make_claim(
+            "c1", BALANCE, context=Context(as_of=MONDAY, source="bank-api"), value=900
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BALANCE, query_context=ctx(MONDAY),
+            claims=(claim,), conflict_entries=(),
+        )
+        assert result.status == DETERMINED
+        assert result.candidates == (claim,)
+
+    def test_ct_04_incompatible_non_none_context_field_excludes_claim(self) -> None:
+        claim = make_claim(
+            "c1", BALANCE, context=Context(as_of=MONDAY, source="bank-api"), value=900
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BALANCE,
+            query_context=Context(as_of=MONDAY, source="user-entered"),
+            claims=(claim,), conflict_entries=(),
+        )
+        assert result.status == UNKNOWN
+        assert claim not in result.candidates
+
+    def test_ct_05_metadata_only_difference_uses_core_merge_not_custom_logic(self) -> None:
+        claim = make_claim(
+            "c1", BALANCE, context=Context(as_of=MONDAY, metadata={"note": "a"}), value=900
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BALANCE,
+            query_context=Context(as_of=MONDAY, metadata={"note": "b"}),
+            claims=(claim,), conflict_entries=(),
+        )
+        assert result.status == UNKNOWN
+
     def test_bp_08_ct_08_recency_never_breaks_a_tie(self) -> None:
         # Both claims share the exact same Context (same as_of), so neither
         # is excluded by Context.merge() — recency must not be used to pick
@@ -412,6 +448,63 @@ class TestContradiction:
         assert resolved in result.conflict_entries
         assert resolution in result.conflict_entries
         assert unresolved in result.conflict_entries
+
+    def test_cf_09_statement_ref_matches_via_identity_not_bare_equality(self) -> None:
+        c1 = make_claim("c1", BIRTH_DATE, context=ctx(MONDAY), value="1990-04-12")
+        c2 = make_claim("c2", BIRTH_DATE, context=ctx(MONDAY), value="1991-04-12")
+        namespaced_statement = Ref(id=c1.id, namespace=Namespace(("some", "ns")))
+        contradiction = self._contradiction((namespaced_statement, Ref(id=c2.id)))
+        result = belief_state(
+            subject=SUBJECT, predicate=BIRTH_DATE, query_context=ctx(MONDAY),
+            claims=(c1, c2), conflict_entries=(contradiction,),
+        )
+        assert result.status == UNRESOLVED_CONFLICT
+
+    def test_cf_12_multiple_resolutions_for_same_contradiction_all_preserved(self) -> None:
+        c1 = make_claim("c1", BIRTH_DATE, context=ctx(MONDAY), value="1990-04-12")
+        c2 = make_claim("c2", BIRTH_DATE, context=ctx(MONDAY), value="1991-04-12")
+        contradiction = self._contradiction((Ref(id=c1.id), Ref(id=c2.id)))
+        resolution1 = Resolution(
+            contradiction=Ref(id=contradiction.id),
+            rationale="first pass",
+            resolved_by=AGENT,
+            at=WallInstant(datetime(2024, 1, 2, tzinfo=UTC)),
+        )
+        resolution2 = Resolution(
+            contradiction=Ref(id=contradiction.id),
+            rationale="revisited",
+            resolved_by=AGENT,
+            at=WallInstant(datetime(2024, 1, 3, tzinfo=UTC)),
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BIRTH_DATE, query_context=ctx(MONDAY),
+            claims=(c1, c2), conflict_entries=(contradiction, resolution1, resolution2),
+        )
+        assert result.status == RESOLVED_OPAQUE_CONFLICT
+        assert result.conflict_entries == (contradiction, resolution1, resolution2)
+
+    def test_cf_14_differing_authority_values_never_compared_to_each_other(self) -> None:
+        # Each claim's Context.authority is only ever merged against the query's
+        # (which leaves it None), never against the other claim's — so two claims
+        # with different "authority-looking" values both remain independently
+        # compatible, and neither is preferred. Proves Memory doesn't judge authority.
+        query_context = ctx(MONDAY)
+        verified: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "cv"), subject=SUBJECT, predicate=BIRTH_DATE,
+            value=Known("1990-04-12"), context=Context(as_of=MONDAY, authority="verified"),
+            asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        unverified: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "cu"), subject=SUBJECT, predicate=BIRTH_DATE,
+            value=Known("1991-04-12"), context=Context(as_of=MONDAY, authority="unverified"),
+            asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BIRTH_DATE, query_context=query_context,
+            claims=(verified, unverified), conflict_entries=(),
+        )
+        assert result.status == AMBIGUOUS
+        assert set(result.candidates) == {verified, unverified}
 
 
 class TestBeliefProjectionConstructorInvariants:
