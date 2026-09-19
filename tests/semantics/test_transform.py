@@ -125,6 +125,28 @@ class TestTransformConstruction:
         assert hash(a) == hash(b)
 
 
+class TestPipelineConstruction:
+    def test_rejects_zero_stages(self) -> None:
+        with pytest.raises(ValueError, match="at least two Transform stages"):
+            Pipeline(())
+
+    def test_rejects_one_stage(self) -> None:
+        with pytest.raises(ValueError, match="at least two Transform stages"):
+            Pipeline((make_transform(id_suffix="a"),))
+
+    def test_accepts_two_stages(self) -> None:
+        pipeline = Pipeline[int, int](
+            (make_transform(id_suffix="a"), make_transform(id_suffix="b"))
+        )
+        result = pipeline.apply(
+            5,
+            clock=FixedClock(),
+            monotonic_clock=SequentialMonotonicClock(),
+            ids=SequentialIdSource(),
+        )
+        assert isinstance(result, Ok)
+
+
 class TestComposition:
     def test_then_returns_pipeline_never_another_transform(self) -> None:
         a = make_transform(id_suffix="a")

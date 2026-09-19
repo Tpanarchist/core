@@ -155,7 +155,9 @@ class Pipeline[A, B]:
     """
 
     def __init__(self, stages: tuple[Transform[Any, Any], ...]) -> None:
-        self._stages = stages
+        if len(stages) < 2:
+            raise ValueError("Pipeline requires at least two Transform stages")
+        self._stages = tuple(stages)
 
     def then[C](self, other: Transform[B, C]) -> Pipeline[A, C]:
         """Returns a new Pipeline with ``other`` appended; the original is unchanged."""
