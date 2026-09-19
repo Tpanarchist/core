@@ -19,13 +19,16 @@ from core.identity import Id, Namespace, Ref
 from core.time import WallInstant
 from core.value import Kind, Known, Unknown
 from memory.episode import Episode
+from memory.recall import IDENTITY_MATCH, LEXICAL_MATCH
 from memory.retention import RetentionMark
 from memory.store import (
     IdentityCollision,
     InMemoryStore,
+    RetrievalQuery,
     UnsupportedMemoryRecord,
     _canonical_episode_header,  # pyright: ignore[reportPrivateUsage]
     _canonical_record,  # pyright: ignore[reportPrivateUsage]
+    lexical_content,
 )
 
 CLAIM_KIND = Kind("memory.test.claim")
@@ -791,3 +794,287 @@ class TestEpisodeStoreSurface:
         resolved = store.resolve(episode_id)
         assert isinstance(resolved, Episode)
         assert dict(resolved.context.scope) == {"k": 1}  # type: ignore[arg-type]
+
+
+class TestLexicalContent:
+    def test_observation_bare_string_value_searchable(self) -> None:
+        from core.observation import Observation
+
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="hello world",
+            at=AT, source="s", context=CTX,
+        )
+        assert "hello world" in lexical_content(obs)
+
+    def test_observation_int_value_not_searchable(self) -> None:
+        # source/observer are also checked per MEMORY_ARCHITECTURE.md's frozen
+        # table, so they must be non-str here too, or this would not actually
+        # be testing that a non-str value is excluded.
+        from core.observation import Observation
+
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value=42,
+            at=AT, source=7, context=CTX,
+        )
+        assert lexical_content(obs) == ()
+
+    def test_claim_known_str_searchable_unknown_not(self) -> None:
+        known = make_claim("c1", value="findme")
+        assert "findme" in lexical_content(known)
+        unknown: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "c2"), subject=SUBJECT, predicate=Kind("memory.test.p"),
+            value=Unknown(), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        assert lexical_content(unknown) == ()
+
+    def test_event_bare_string_payload_searchable_bytes_not(self) -> None:
+        e1 = Event(id=Id(EVENT_KIND, "e1"), kind=EVENT_KIND, at=AT, payload="text")
+        assert "text" in lexical_content(e1)
+        e2 = Event(id=Id(EVENT_KIND, "e2"), kind=EVENT_KIND, at=AT, payload=b"bytes")
+        assert lexical_content(e2) == ()
+
+    def test_effect_description_always_target_when_string(self) -> None:
+        from core.effect import Effect
+
+        effect = Effect(
+            id=Id(Kind("memory.test.effect"), "f1"), kind=Kind("memory.test.k"),
+            description="did a thing", target="str target", at=AT,
+        )
+        content = lexical_content(effect)
+        assert "did a thing" in content
+        assert "str target" in content
+
+    def test_error_message_and_operation_searchable(self) -> None:
+        error = Error(
+            id=Id(ERROR_KIND, "err1"), kind=ERROR_KIND, message="failed hard",
+            at=AT, operation="do-thing",
+        )
+        content = lexical_content(error)
+        assert "failed hard" in content
+        assert "do-thing" in content
+
+    def test_provenance_transform_name_and_version_searchable(self) -> None:
+        from core.provenance import Provenance
+        from core.time import Duration
+
+        prov = Provenance(
+            id=Id(Kind("memory.test.prov"), "p1"), transform_id=Id(Kind("memory.test.tx"), "t1"),
+            transform_name="normalize", transform_version="1.0", inputs=(), parents=(), at=AT,
+            duration=Duration(0),
+        )
+        content = lexical_content(prov)
+        assert "normalize" in content
+        assert "1.0" in content
+
+    def test_inference_and_contradiction_and_episode_contribute_nothing(self) -> None:
+        claim = make_claim("c1", value="text")
+        inference = Inference(
+            id=Id(Kind("memory.test.inference"), "i1"), premises=(),
+            method=Kind("memory.test.m"), conclusion=claim, at=AT,
+        )
+        assert lexical_content(inference) == ()
+        contradiction = Contradiction(
+            id=Id(CONTRA_KIND, "k1"), subject=SUBJECT,
+            statements=(Ref(id=claim.id), Ref(id=Id(CLAIM_KIND, "x"))),
+            detected_at=AT, context=CTX,
+        )
+        assert lexical_content(contradiction) == ()
+        episode = Episode(
+            id=Id(Kind("memory.test.episode"), "ep1"), subject=SUBJECT, context=CTX, opened_at=AT
+        )
+        assert lexical_content(episode) == ()
+
+
+class TestRetrievalQuery:
+    def test_neither_identity_nor_text_rejects(self) -> None:
+        with pytest.raises(ValueError):
+            RetrievalQuery(context=CTX)
+
+    def test_empty_text_rejects(self) -> None:
+        with pytest.raises(ValueError):
+            RetrievalQuery(context=CTX, text="")
+
+    def test_identity_only_is_valid(self) -> None:
+        RetrievalQuery(context=CTX, identity=SUBJECT)  # must not raise
+
+    def test_text_only_is_valid(self) -> None:
+        RetrievalQuery(context=CTX, text="hello")  # must not raise
+
+
+class TestRetrieve:
+    def test_identity_only_retrieval(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="x",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        candidates = store.retrieve(RetrievalQuery(context=CTX, identity=obs.id), retrieved_at=AT)
+        assert len(candidates) == 1
+        assert candidates[0].item.id == obs.id
+        assert candidates[0].relevance == (IDENTITY_MATCH,)
+
+    def test_text_only_retrieval(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findable text",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        candidates = store.retrieve(RetrievalQuery(context=CTX, text="findable"), retrieved_at=AT)
+        assert len(candidates) == 1
+        assert candidates[0].relevance == (LEXICAL_MATCH,)
+
+    def test_combined_identity_and_lexical_match_produces_one_candidate_both_kinds(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findable text",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        candidates = store.retrieve(
+            RetrievalQuery(context=CTX, identity=obs.id, text="findable"), retrieved_at=AT
+        )
+        assert len(candidates) == 1
+        assert candidates[0].relevance == (IDENTITY_MATCH, LEXICAL_MATCH)
+
+    def test_retrieved_at_and_query_context_copied_exactly(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="x",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        query_ctx = Context(as_of=WallInstant(datetime(2024, 3, 1, tzinfo=UTC)))
+        retrieved_at = WallInstant(datetime(2024, 3, 2, tzinfo=UTC))
+        candidates = store.retrieve(
+            RetrievalQuery(context=query_ctx, identity=obs.id), retrieved_at=retrieved_at
+        )
+        assert candidates[0].query_context == query_ctx
+        assert candidates[0].retrieved_at == retrieved_at
+
+    def test_case_sensitive_substring_not_fts_operators(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="Hello World",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        # case-sensitive
+        assert store.retrieve(RetrievalQuery(context=CTX, text="hello"), retrieved_at=AT) == ()
+        assert len(store.retrieve(RetrievalQuery(context=CTX, text="Hello"), retrieved_at=AT)) == 1
+        # FTS-looking characters are ordinary literal characters, not operators.
+        store2 = InMemoryStore()
+        literal_obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o2"), subject=SUBJECT, value='a "quoted*" (thing)',
+            at=AT, source="s", context=CTX,
+        )
+        store2.persist(literal_obs)
+        assert len(
+            store2.retrieve(RetrievalQuery(context=CTX, text='"quoted*"'), retrieved_at=AT)
+        ) == 1
+
+    def test_no_result_limit(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        for i in range(50):
+            obs: Observation[object] = Observation(
+                id=Id(Kind("memory.test.obs"), f"o{i}"), subject=SUBJECT, value="shared text",
+                at=AT, source="s", context=CTX,
+            )
+            store.persist(obs)
+        candidates = store.retrieve(RetrievalQuery(context=CTX, text="shared"), retrieved_at=AT)
+        assert len(candidates) == 50
+
+
+class TestRetrievalRetention:
+    def test_rr_01_active_eligible_by_default(self) -> None:
+        from core.observation import Observation
+        from memory.retention import ACTIVE
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ACTIVE, at=AT))
+        assert len(store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)) == 1
+
+    def test_rr_02_rr_03_archived_excluded_by_default_included_when_requested(self) -> None:
+        from core.observation import Observation
+        from memory.retention import ARCHIVED
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+        assert store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT) == ()
+        assert len(
+            store.retrieve(
+                RetrievalQuery(context=CTX, text="findme", include_archived=True), retrieved_at=AT
+            )
+        ) == 1
+
+    def test_rr_07_no_mark_treated_as_active(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        assert len(store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)) == 1
+
+    def test_deprioritized_ordered_after_active(self) -> None:
+        from core.observation import Observation
+        from memory.retention import DEPRIORITIZED
+
+        store = InMemoryStore()
+        deprioritized_obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme first",
+            at=AT, source="s", context=CTX,
+        )
+        active_obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o2"), subject=SUBJECT, value="findme second",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(deprioritized_obs)
+        store.persist(active_obs)
+        store.persist(
+            RetentionMark(item=Ref(id=deprioritized_obs.id), accessibility=DEPRIORITIZED, at=AT)
+        )
+        candidates = store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
+        assert [c.item.id for c in candidates] == [active_obs.id, deprioritized_obs.id]
+
+    def test_custom_accessibility_kind_raises_on_default_retrieval(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(
+            RetentionMark(
+                item=Ref(id=obs.id), accessibility=Kind("memory.retention.legal_hold"), at=AT
+            )
+        )
+        with pytest.raises(ValueError):
+            store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)

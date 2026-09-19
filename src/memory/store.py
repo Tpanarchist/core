@@ -37,7 +37,8 @@ from memory.codec import (
     encode_wall_instant,
 )
 from memory.episode import Episode
-from memory.retention import RetentionMark
+from memory.recall import IDENTITY_MATCH, LEXICAL_MATCH, RecallCandidate
+from memory.retention import ACTIVE, ARCHIVED, DEPRIORITIZED, RetentionLog, RetentionMark
 
 type EntityMemoryRecord = (
     Observation[object]
@@ -587,3 +588,101 @@ class InMemoryStore:
     def close_episode(self, episode: Id | Ref, at: WallInstant) -> None:
         stored = self._require_episode(episode)
         stored.close(at)
+
+    def retrieve(
+        self, query: RetrievalQuery, *, retrieved_at: WallInstant
+    ) -> tuple[RecallCandidate, ...]:
+        identity_target = identity_of(query.identity) if query.identity is not None else None
+
+        raw: list[tuple[Id, list[Kind]]] = []  # (entity_id, relevance kinds in order)
+        seen: dict[Id, int] = {}  # entity_id -> index into raw
+
+        if identity_target is not None and identity_target in self._entities:
+            raw.append((identity_target, [IDENTITY_MATCH]))
+            seen[identity_target] = 0
+
+        if query.text is not None:
+            for entity_id in self._entity_order:
+                entity = self._entities[entity_id]
+                if any(query.text in text for text in lexical_content(entity)):
+                    if entity_id in seen:
+                        raw[seen[entity_id]][1].append(LEXICAL_MATCH)
+                    else:
+                        seen[entity_id] = len(raw)
+                        raw.append((entity_id, [LEXICAL_MATCH]))
+
+        retention_log = RetentionLog()
+        for mark in self._retention_marks:
+            retention_log.record(mark)
+
+        active: list[RecallCandidate] = []
+        deprioritized: list[RecallCandidate] = []
+        archived: list[RecallCandidate] = []
+        for entity_id, relevance_kinds in raw:
+            accessibility = retention_log.current(entity_id)
+            candidate = RecallCandidate(
+                item=Ref(id=entity_id),
+                query_context=query.context,
+                relevance=tuple(relevance_kinds),
+                retrieved_at=retrieved_at,
+            )
+            if accessibility == ACTIVE:
+                active.append(candidate)
+            elif accessibility == DEPRIORITIZED:
+                deprioritized.append(candidate)
+            elif accessibility == ARCHIVED:
+                archived.append(candidate)
+            else:
+                raise ValueError(
+                    f"default retrieval cannot interpret custom accessibility "
+                    f"Kind {accessibility!r} for {entity_id!r}"
+                )
+
+        if query.include_archived:
+            return tuple(active) + tuple(deprioritized) + tuple(archived)
+        return tuple(active) + tuple(deprioritized)
+
+
+def lexical_content(record: EntityMemoryRecord) -> tuple[str, ...]:
+    """Only genuinely textual content already present on a record — never
+    str()/repr() of anything else, and no recursive extraction from nested
+    structures. Frozen field-by-field per MEMORY_ARCHITECTURE.md.
+    """
+    if isinstance(record, Observation):
+        return tuple(
+            v for v in (record.value, record.source, record.observer) if isinstance(v, str)
+        )
+    if isinstance(record, Claim):
+        if isinstance(record.value, Known) and isinstance(record.value.value, str):
+            return (record.value.value,)
+        return ()
+    if isinstance(record, Event):
+        return (record.payload,) if isinstance(record.payload, str) else ()
+    if isinstance(record, Effect):
+        content = [record.description]
+        if isinstance(record.target, str):
+            content.append(record.target)
+        return tuple(content)
+    if isinstance(record, Provenance):
+        return (record.transform_name, record.transform_version)
+    if isinstance(record, Error):
+        content = [record.message]
+        if record.operation is not None:
+            content.append(record.operation)
+        return tuple(content)
+    # Inference, Contradiction, Episode contribute nothing generically.
+    return ()
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class RetrievalQuery:
+    context: Context
+    identity: Id | Ref | None = None
+    text: str | None = None
+    include_archived: bool = False
+
+    def __post_init__(self) -> None:
+        if self.identity is None and self.text is None:
+            raise ValueError("RetrievalQuery requires at least one of identity or text")
+        if self.text is not None and not self.text:
+            raise ValueError("RetrievalQuery.text must not be empty if supplied")
