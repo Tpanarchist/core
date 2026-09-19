@@ -336,6 +336,79 @@ class TestPersistDoesNotMutateCallerOrLeakMutation:
             resolved.value["a"] = 2  # type: ignore[index]
 
 
+class TestContextSnapshotIsolation:
+    def test_context_scope_mutation_after_persist_does_not_leak(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        mutable_scope: dict[str, object] = {"k": 1}
+        ctx = Context(as_of=AT, scope=mutable_scope)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="x",
+            at=AT, source="s", context=ctx,
+        )
+        store.persist(obs)
+        mutable_scope["k"] = 999
+        resolved = store.resolve(obs.id)
+        assert resolved is not None
+        assert dict(resolved.context.scope) == {"k": 1}  # type: ignore[union-attr,arg-type]
+
+    def test_context_scope_snapshot_is_itself_immutable(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        ctx = Context(as_of=AT, scope={"k": 1})
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="x",
+            at=AT, source="s", context=ctx,
+        )
+        store.persist(obs)
+        resolved = store.resolve(obs.id)
+        assert resolved is not None
+        with pytest.raises(TypeError):
+            resolved.context.scope["k"] = 2  # type: ignore[index,union-attr]
+
+    def test_claim_context_snapshot_isolation(self) -> None:
+        store = InMemoryStore()
+        mutable_units: dict[str, object] = {"unit": "meters"}
+        ctx = Context(as_of=AT, units=mutable_units)
+        claim: Claim[object] = Claim(
+            id=Id(CLAIM_KIND, "c1"), subject=SUBJECT, predicate=Kind("memory.test.p"),
+            value=Known("v"), context=ctx, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(claim)
+        mutable_units["unit"] = "changed"
+        resolved = store.resolve(claim.id)
+        assert resolved is not None
+        assert dict(resolved.context.units) == {"unit": "meters"}  # type: ignore[union-attr,arg-type]
+
+    def test_contradiction_context_snapshot_isolation(self) -> None:
+        store = InMemoryStore()
+        mutable_authority: dict[str, object] = {"who": "alice"}
+        ctx = Context(as_of=AT, authority=mutable_authority)
+        contradiction = Contradiction(
+            id=Id(Kind("memory.test.contradiction"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=Id(CLAIM_KIND, "a")), Ref(id=Id(CLAIM_KIND, "b"))),
+            detected_at=AT, context=ctx,
+        )
+        store.persist(contradiction)
+        mutable_authority["who"] = "changed"
+        resolved = store.resolve(contradiction.id)
+        assert resolved is not None
+        assert dict(resolved.context.authority) == {"who": "alice"}  # type: ignore[union-attr,arg-type]
+
+    def test_error_context_snapshot_isolation(self) -> None:
+        store = InMemoryStore()
+        mutable_env: dict[str, object] = {"host": "a"}
+        ctx = Context(as_of=AT, environment=mutable_env)
+        error = Error(id=Id(ERROR_KIND, "e1"), kind=ERROR_KIND, message="m", at=AT, context=ctx)
+        store.persist(error)
+        mutable_env["host"] = "changed"
+        resolved = store.resolve(error.id)
+        assert resolved is not None
+        assert dict(resolved.context.environment) == {"host": "a"}  # type: ignore[union-attr,arg-type]
+
+
 class TestEmbeddedEntities:
     def test_persist_inference_with_new_conclusion_registers_both(self) -> None:
         store = InMemoryStore()

@@ -233,10 +233,10 @@ def _canonical_record(
     here — Resolution/RetentionMark never do (append-only, no canonical
     comparison), and Episode uses _canonical_episode_header instead.
 
-    Only used from tests in this task; Tasks 2-6 call it from persist() /
-    create_episode() for identity-collision detection, which will make this
-    ignore comment (and the one on _canonical_episode_header below)
-    unnecessary — left for a later task to remove.
+    Called from InMemoryStore.persist() (via _snapshot_simple_entity's
+    fallthrough branch) for identity-collision detection. Also still used
+    directly from tests. _canonical_episode_header below remains unused until
+    Task 4 wires it into create_episode(), hence its own ignore comment.
     """
     if isinstance(record, Observation):
         return _canonical_observation(record)
@@ -307,10 +307,37 @@ class InMemoryStore:
         self._entity_canonical[id] = canonical
         self._entity_order.append(id)
 
+    def _snapshot_context(self, context: Context) -> Context:
+        """Reconstruct a Context with every object-typed field replaced by its
+        as_persisted_value()-validated snapshot. Context.__post_init__ only
+        shallow-freezes metadata; scope/environment/source/authority/version/units
+        carry no protection at all, so without this a caller's later mutation of
+        any of them would leak straight through to what resolve() returns.
+        """
+        return dataclasses.replace(
+            context,
+            scope=as_persisted_value(context.scope) if context.scope is not None else None,
+            environment=(
+                as_persisted_value(context.environment)
+                if context.environment is not None
+                else None
+            ),
+            source=as_persisted_value(context.source) if context.source is not None else None,
+            authority=(
+                as_persisted_value(context.authority) if context.authority is not None else None
+            ),
+            version=as_persisted_value(context.version) if context.version is not None else None,
+            units=as_persisted_value(context.units) if context.units is not None else None,
+            metadata=(
+                as_persisted_value(context.metadata) if context.metadata is not None else None
+            ),
+        )
+
     def _snapshot_simple_entity(self, record: EntityMemoryRecord) -> EntityMemoryRecord:
-        """Reconstruct a record with every object-typed payload field replaced
-        by its as_persisted_value()-validated snapshot, via dataclasses.replace
-        — never store a reference the caller could later mutate through.
+        """Reconstruct a record with every object-typed payload field (including
+        context) replaced by its as_persisted_value()-validated snapshot, via
+        dataclasses.replace — never store a reference the caller could later
+        mutate through.
         """
         if isinstance(record, Observation):
             return dataclasses.replace(
@@ -320,9 +347,18 @@ class InMemoryStore:
                 observer=(
                     as_persisted_value(record.observer) if record.observer is not None else None
                 ),
+                context=self._snapshot_context(record.context),
             )
         if isinstance(record, Event):
-            return dataclasses.replace(record, payload=as_persisted_value(record.payload))
+            return dataclasses.replace(
+                record,
+                payload=as_persisted_value(record.payload),
+                context=(
+                    self._snapshot_context(record.context)
+                    if record.context is not None
+                    else None
+                ),
+            )
         if isinstance(record, Effect):
             return dataclasses.replace(
                 record,
@@ -330,14 +366,33 @@ class InMemoryStore:
                 metadata=(
                     as_persisted_value(record.metadata) if record.metadata is not None else None
                 ),
+                context=(
+                    self._snapshot_context(record.context)
+                    if record.context is not None
+                    else None
+                ),
             )
-        # Contradiction and Provenance have no object-typed payload fields.
+        if isinstance(record, Contradiction):
+            return dataclasses.replace(record, context=self._snapshot_context(record.context))
+        if isinstance(record, Provenance):
+            return dataclasses.replace(
+                record,
+                context=(
+                    self._snapshot_context(record.context)
+                    if record.context is not None
+                    else None
+                ),
+            )
         return record
 
     def _snapshot_claim(self, claim: Claim[object]) -> Claim[object]:
         if isinstance(claim.value, Known):
-            return dataclasses.replace(claim, value=Known(as_persisted_value(claim.value.value)))
-        return claim  # Unknown carries no payload to snapshot
+            return dataclasses.replace(
+                claim,
+                value=Known(as_persisted_value(claim.value.value)),
+                context=self._snapshot_context(claim.context),
+            )
+        return dataclasses.replace(claim, context=self._snapshot_context(claim.context))
 
     def _snapshot_episode(self, episode: Episode) -> Episode:
         """A fresh, independent Episode with identical observable state —
@@ -420,7 +475,14 @@ class InMemoryStore:
                 as_persisted_value(original.metadata) if original.metadata is not None else None
             )
             stored = dataclasses.replace(
-                original, cause=rebuilt_cause, metadata=snapshotted_metadata
+                original,
+                cause=rebuilt_cause,
+                metadata=snapshotted_metadata,
+                context=(
+                    self._snapshot_context(original.context)
+                    if original.context is not None
+                    else None
+                ),
             )
             canonical = _canonical_error(stored)
             action = self._check(stored.id, canonical, Error)
