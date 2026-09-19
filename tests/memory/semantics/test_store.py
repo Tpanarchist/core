@@ -704,6 +704,13 @@ class TestEpisodeStoreSurface:
         with pytest.raises(IdentityCollision):
             store.create_episode(id=shared_id, subject=SUBJECT, context=CTX, opened_at=AT)
 
+    def test_persist_colliding_with_existing_episode_raises_identity_collision(self) -> None:
+        store = InMemoryStore()
+        episode_id = Id(Kind("memory.test.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        with pytest.raises(IdentityCollision):
+            store.persist(Event(id=episode_id, kind=EVENT_KIND, at=AT, payload="p"))
+
     def test_append_exact_order_and_duplicates_preserved(self) -> None:
         store = InMemoryStore()
         episode_id = Id(Kind("memory.test.episode"), "ep1")

@@ -297,7 +297,7 @@ class InMemoryStore:
         existing = self._entities.get(id)
         if existing is None:
             return "insert"
-        if self._entity_canonical[id] == canonical:
+        if self._entity_canonical.get(id) == canonical:
             return "idempotent"
         raise IdentityCollision(id, type(existing), incoming_type)
 
