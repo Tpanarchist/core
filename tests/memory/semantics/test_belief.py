@@ -300,6 +300,24 @@ class TestContradiction:
         )
         assert result.status == UNRESOLVED_CONFLICT
         assert contradiction in result.conflict_entries
+        assert result.candidates == (c1, c2)
+
+    def test_cf_relevance_survives_context_filtering(self) -> None:
+        # The single most subtle property in this module: relevant-Contradiction
+        # membership is computed from the FULL (subject, predicate) slot, gathered
+        # BEFORE context filtering — not from `candidates` (post-filter). A claim
+        # that is in the slot but context-incompatible with the query must still
+        # establish relevance, even though it does not appear in `candidates`.
+        filtered_out = make_claim("c1", BIRTH_DATE, context=ctx(FRIDAY), value="1990-04-12")
+        contradiction = self._contradiction(
+            (Ref(id=filtered_out.id), Ref(id=Id(CLAIM_KIND, "other")))
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BIRTH_DATE, query_context=ctx(MONDAY),
+            claims=(filtered_out,), conflict_entries=(contradiction,),
+        )
+        assert result.status == UNRESOLVED_CONFLICT
+        assert result.candidates == ()
 
     def test_cf_02_cf_03_cf_04_resolution_never_selects_a_winner(self) -> None:
         c1 = make_claim("c1", BIRTH_DATE, context=ctx(MONDAY), value="1990-04-12")
