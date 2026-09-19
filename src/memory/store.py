@@ -14,6 +14,7 @@ docs/memory-passes/02-persistence-boundary.md (store.py, tier 1).
 from __future__ import annotations
 
 import dataclasses
+from typing import Protocol, runtime_checkable
 
 from core.context import Context
 from core.effect import Effect
@@ -641,6 +642,30 @@ class InMemoryStore:
         if query.include_archived:
             return tuple(active) + tuple(deprioritized) + tuple(archived)
         return tuple(active) + tuple(deprioritized)
+
+
+@runtime_checkable
+class MemoryStore(Protocol):
+    """The persistence-boundary capability. InMemoryStore is the reference
+    implementer; a future SqliteMemoryStore (Pass 3) must satisfy the same
+    protocol and reproduce the same observable behavior.
+    """
+
+    def persist(self, record: PersistRecord) -> None: ...
+    def resolve(self, item: Id | Ref) -> EntityMemoryRecord | None: ...
+    def retrieve(
+        self, query: RetrievalQuery, *, retrieved_at: WallInstant
+    ) -> tuple[RecallCandidate, ...]: ...
+    def claims_for(self, subject: Id | Ref, predicate: Kind) -> tuple[Claim[object], ...]: ...
+    def conflicts_for(
+        self, subject: Id | Ref, predicate: Kind
+    ) -> tuple[Contradiction | Resolution, ...]: ...
+    def retention_for(self, item: Id | Ref) -> tuple[RetentionMark, ...]: ...
+    def create_episode(
+        self, *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant
+    ) -> None: ...
+    def append_episode(self, episode: Id | Ref, item: Ref) -> None: ...
+    def close_episode(self, episode: Id | Ref, at: WallInstant) -> None: ...
 
 
 def lexical_content(record: EntityMemoryRecord) -> tuple[str, ...]:

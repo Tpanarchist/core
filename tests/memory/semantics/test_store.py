@@ -24,6 +24,7 @@ from memory.retention import RetentionMark
 from memory.store import (
     IdentityCollision,
     InMemoryStore,
+    MemoryStore,
     RetrievalQuery,
     UnsupportedMemoryRecord,
     _canonical_episode_header,  # pyright: ignore[reportPrivateUsage]
@@ -1078,3 +1079,27 @@ class TestRetrievalRetention:
         )
         with pytest.raises(ValueError):
             store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
+
+
+class TestMemoryStoreProtocol:
+    def test_in_memory_store_satisfies_protocol(self) -> None:
+        assert isinstance(InMemoryStore(), MemoryStore)
+
+    def test_incomplete_fake_does_not_satisfy_protocol(self) -> None:
+        class IncompleteFake:
+            def persist(self, record: object) -> None: ...
+            def resolve(self, item: object) -> object: ...
+            # missing retrieve/claims_for/conflicts_for/retention_for/episode methods
+
+        assert not isinstance(IncompleteFake(), MemoryStore)
+
+
+class TestNoGenericEnumerationOrDelete:
+    def test_store_has_no_delete_or_enumeration_surface(self) -> None:
+        forbidden = (
+            "delete", "remove", "purge", "overwrite", "upsert",
+            "all_records", "list_everything", "scan",
+        )
+        store = InMemoryStore()
+        for name in forbidden:
+            assert not hasattr(store, name), f"InMemoryStore must not expose {name}()"
