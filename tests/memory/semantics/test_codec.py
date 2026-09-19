@@ -93,6 +93,20 @@ class TestRejections:
         with pytest.raises(UnsupportedPersistedValue):
             as_persisted_value({1: "a"})
 
+    def test_cd_14_repr_raising_key_is_rejected_cleanly(self) -> None:
+        class LoudKey:
+            def __hash__(self) -> int:
+                return 0
+
+            def __eq__(self, other: object) -> bool:
+                return self is other
+
+            def __repr__(self) -> str:
+                raise AssertionError("repr() must never be called on a rejected key")
+
+        with pytest.raises(UnsupportedPersistedValue):
+            as_persisted_value({LoudKey(): "value"})
+
     def test_cd_15_cycles_fail_explicitly(self) -> None:
         cyclic: dict[str, object] = {}
         cyclic["self"] = cyclic

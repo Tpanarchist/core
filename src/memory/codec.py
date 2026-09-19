@@ -82,7 +82,7 @@ def as_persisted_value(
         for key, item in mapping_val.items():
             if not isinstance(key, str):
                 raise UnsupportedPersistedValue(
-                    (*path, repr(key)), key, "mapping keys must be strings"
+                    path, key, "mapping keys must be strings"
                 )
             result[key] = as_persisted_value(item, path=(*path, key), _seen=next_seen)
         return MappingProxyType(result)
