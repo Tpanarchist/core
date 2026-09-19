@@ -47,7 +47,7 @@ Every edge is a real, named import — no `core.*` shorthand.
 | 0 | `episode` | `Episode` | `core.identity`, `core.time`, `core.context` |
 | 0 | `recall` | `RecallCandidate`, `WorkingSet` | `core.identity`, `core.time`, `core.context`, `core.value` |
 | 0 | `retention` | `RetentionMark`, `RetentionLog` | `core.identity`, `core.time`, `core.value` |
-| 0 | `belief` | `BeliefProjection`, `belief_state()` | `core.identity`, `core.context`, `core.value`, `core.epistemic` |
+| 0 | `belief` | `BeliefProjection`, `belief_state()` | `core.identity`, `core.context`, `core.value`, `core.epistemic`, `core.result` |
 | 0 | `codec` | `PersistedValue`, `as_persisted_value()`, Core-primitive encoders | `core.value`, `core.identity`, `core.time`, `core.context` |
 | 1 | `store` | `MemoryStore` (protocol), `InMemoryStore` | `episode`, `recall`, `retention`, `belief`, `codec`, `core.identity`, `core.time`, `core.context`, `core.epistemic`, `core.observation`, `core.event`, `core.effect` *(provisional — see below)* |
 | 2 | `sqlite_store` | `SqliteMemoryStore` | `store`, `codec`, `episode`, `recall`, `retention`, `belief`, `core.identity`, `core.time`, `core.context`, `core.epistemic`, `core.observation`, `core.event`, `core.effect`, stdlib `sqlite3` *(provisional — see below)* |

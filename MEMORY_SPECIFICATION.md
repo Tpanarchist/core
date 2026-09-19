@@ -85,7 +85,7 @@ Memory persists and retrieves Core facts and Memory's own derived records; it ne
 - **Invariants**: append-only; insertion order (tuple position) is authoritative, never reconstructed from `WallInstant`; duplicate `Ref`s preserved, never deduplicated; `.append()` after `.close()` raises; `.close()` is one-time (a second call raises); `closed_at < opened_at` raises at close time; a returned `.items()` snapshot is defensively copied. Entity-bearing (`id: Id`) — it may itself be a retrievable memory item.
 - **Relations**: members are `Ref`s to `Entity`-bearing records (typically `Observation`/`Event`); may itself be the `item` of a `RecallCandidate`.
 - **Representation**: concrete, mutable, single-writer container (same concurrency family as Core's `Trace`/`History`/`ContradictionLog`) — `id: Id`, `subject: Id | Ref`, `context: Context`, a private ordered backing store exposed only via `.items() -> tuple[Ref, ...]`, `opened_at: WallInstant`, `closed_at: WallInstant | None`.
-- **Operations**: construct(subject, context, opened_at); `.append(ref)`; `.items()`; `.close(at)`.
+- **Operations**: construct(*, id, subject, context, opened_at) — `id` is caller-supplied, never internally allocated (Entity construction never allocates its own identity); `.append(ref)`; `.items()`; `.close(at)`.
 - **Counterexample**: sorting an Episode's members by `Observation.at`/`Event.at` after the fact and treating that as authoritative order. Assuming an Observation referenced by an Episode necessarily shares the Episode's `subject`.
 
 ### 2. RecallCandidate
