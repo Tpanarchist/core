@@ -149,9 +149,11 @@ Memory persists and retrieves Core facts and Memory's own derived records; it ne
 
 Persistence is governed by three commitments, realized in `MEMORY_ARCHITECTURE.md`:
 
-1. **Persistence eligibility is not equivalent to Core `Entity` membership.** The admissible record union is a Memory-level decision, pinned at Pass 2 preregistration.
+1. **Persistence eligibility is not equivalent to Core `Entity` membership.** The admissible record union is a Memory-level decision, frozen at Pass 2 preregistration (`docs/memory-passes/02-persistence-boundary.md` §2; see `MEMORY_ARCHITECTURE.md`).
 2. **Storage-local identity never becomes semantic identity.** A `Resolution` or `RetentionMark` persisted with a SQLite row key remains non-`Entity` after persistence; no API exists to construct a `Ref` to a storage-local key.
 3. **`PersistedValue` is the entire durable-value domain**, and crossing it is validated, never converted. Anything outside the domain fails loudly, by exact path, at persist time — never stringified, pickled, or silently dropped.
+
+**Pass 2 boundary clarification** (no new Memory construction — this narrows, not expands, the existing three commitments above): generic `persist()` excludes `Episode`, which uses its own `create_episode`/`append_episode`/`close_episode` surface instead, since its mutable append/close transitions can't be expressed as one call. Two Core structures embed other admissible Entity records directly — `Inference.conclusion` (a `Claim`) and `Error.cause` (an `Error | None`) — and persisting the parent atomically registers the embedded record too, under its own `Id`, in the same single stored-identity regime as everything else; this is structural (only these two specifically-typed fields), never generic reflection over arbitrary objects.
 
 ## Explicitly not in this specification
 

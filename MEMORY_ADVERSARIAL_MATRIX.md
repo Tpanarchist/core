@@ -314,23 +314,27 @@ Persistence eligibility must be an explicit union, not `Entity`.
 | PA-10 | Retrieve non-Entity row | Does not magically gain Core Id |
 | PA-11 | Attempt to create Ref to storage sequence id | No API exists to do so |
 
-The persisted union remains provisional (`MEMORY_ARCHITECTURE.md`) until Pass 2 preregistration settles at least:
+**Frozen Pass-2 union** (`MEMORY_ARCHITECTURE.md`, `docs/memory-passes/02-persistence-boundary.md` §2):
 
 ```text
-Observation
-Claim
-Inference
-Contradiction
-Resolution
-Event
-Effect
-Provenance
-Error
-Episode
-RetentionMark
+type EntityMemoryRecord = (
+    Observation[object] | Claim[object] | Inference[object] | Contradiction
+    | Event | Effect | Provenance | Error | Episode
+)
+
+type NonEntityMemoryRecord = Resolution | RetentionMark
+
+type MemoryRecord = EntityMemoryRecord | NonEntityMemoryRecord
+
+type PersistRecord = (
+    Observation[object] | Claim[object] | Inference[object] | Contradiction
+    | Resolution | Event | Effect | Provenance | Error | RetentionMark
+)
 ```
 
-The dependency table in `MEMORY_ARCHITECTURE.md` is explicitly marked provisional until that question is answered.
+`PersistRecord` — every `MemoryRecord` except `Episode` — is what generic `persist()` accepts; `Episode` uses the dedicated `create_episode`/`append_episode`/`close_episode` surface instead (matrix section M covers its transition semantics). No other Core or user type is admitted in Memory v0. The `MEMORY_ARCHITECTURE.md` dependency table now carries this union as a frozen (non-provisional) row.
+
+Two admitted structures embed other admissible Entity records directly and pull them into the store atomically with their parent: `Inference.conclusion → Claim`, `Error.cause → Error | None`. `Error.exception` (a foreign `BaseException`) has no Memory v0 codec — an `Error` with `exception is not None` is rejected outright (`UnsupportedPersistedValue`), never reduced to a type name, message, `repr()`, or pickle.
 
 ---
 
@@ -864,17 +868,29 @@ Frozen (adopted into `MEMORY_SPECIFICATION.md`/`MEMORY_ARCHITECTURE.md`):
     Resolution.rationale and RetentionMark.rationale are excluded (round 5; see FT-02/FT-03).
 11. MemoryStore.retrieve() takes an explicit retrieved_at: WallInstant; never an
     implicit wall-clock read (round 5).
+12. Exact persisted-record union (EntityMemoryRecord/NonEntityMemoryRecord/MemoryRecord/
+    PersistRecord) and the store/sqlite_store dependency edges it implies. (Pass 2)
+13. Episode's create/append/close store surface — its own API shape, distinct from
+    generic persist(). (Pass 2)
+14. Identity-collision policy uses a private canonical PersistedValue representation for
+    comparison, never a record's own __eq__ (frozen specifically to catch Event's
+    Id-only equality). IdentityCollision/UnsupportedMemoryRecord as the two supporting
+    exceptions. (Pass 2)
+15. Persistence is closed over directly embedded admissible Entity records
+    (Inference.conclusion, Error.cause); Error.exception is unconditionally unsupported. (Pass 2)
+16. Lexical query contract: literal, case-sensitive substring matching over a frozen
+    per-record-type lexical_content() field list — no FTS operators, no normalization,
+    no case folding, no stemming. (Pass 2)
+17. belief_state duplicate Claim inputs: same Id + identical content collapses to one
+    (first-occurrence position); same Id + different content raises ValueError. (Pass 1,
+    shipped in belief.py — recorded here for completeness, not left open.)
 ```
 
 Still open, deferred to pass preregistration (`MEMORY_ARCHITECTURE.md`):
 
 ```text
-a. Exact persisted-record union — this also finalizes store/sqlite_store dependency edges. (Pass 2)
-b. Episode's create/append/close store surface — persist(record) alone cannot express
-   its frozen one-way transitions; needs its own API shape. (Pass 2)
-c. belief_state duplicate Claim inputs: normalize by Claim Id, or treat caller input literally. (Pass 1)
-d. Store corruption/decode exception shapes. (Pass 3)
-e. Lexical query contract: literal terms vs. exposed FTS syntax. (Pass 3)
+a. Store corruption/decode exception shapes. (Pass 3)
+b. SqliteMemoryStore's exact dependency edges and concrete schema/table shape. (Pass 3)
 ```
 
 None of the open items requires a new ontology concept. They are implementation semantics to decide when the relevant pass's code is actually being written.

@@ -49,23 +49,42 @@ Every edge is a real, named import — no `core.*` shorthand.
 | 0 | `retention` | `RetentionMark`, `RetentionLog` | `core.identity`, `core.time`, `core.value` |
 | 0 | `belief` | `BeliefProjection`, `belief_state()` | `core.identity`, `core.context`, `core.value`, `core.epistemic`, `core.result` |
 | 0 | `codec` | `PersistedValue`, `as_persisted_value()`, Core-primitive encoders | `core.value`, `core.identity`, `core.time`, `core.context` |
-| 1 | `store` | `MemoryStore` (protocol), `InMemoryStore` | `episode`, `recall`, `retention`, `belief`, `codec`, `core.identity`, `core.time`, `core.context`, `core.epistemic`, `core.observation`, `core.event`, `core.effect` *(provisional — see below)* |
-| 2 | `sqlite_store` | `SqliteMemoryStore` | `store`, `codec`, `episode`, `recall`, `retention`, `belief`, `core.identity`, `core.time`, `core.context`, `core.epistemic`, `core.observation`, `core.event`, `core.effect`, stdlib `sqlite3` *(provisional — see below)* |
+| 1 | `store` | `MemoryStore` (protocol), `InMemoryStore` | `episode`, `recall`, `retention`, `codec`, `core.identity`, `core.time`, `core.context`, `core.value`, `core.epistemic`, `core.observation`, `core.event`, `core.effect`, `core.provenance`, `core.error` |
+| 2 | `sqlite_store` | `SqliteMemoryStore` | `store`, `codec`, `episode`, `recall`, `retention`, `core.identity`, `core.time`, `core.context`, `core.value`, `core.epistemic`, `core.observation`, `core.event`, `core.effect`, `core.provenance`, `core.error`, stdlib `sqlite3` *(exact shape finalized in Pass 3 — this row already reflects Pass 2's frozen persisted-record union)* |
 
 Tier-0 modules (`episode`, `recall`, `retention`, `belief`, `codec`) do not depend on each other — each is independently meaningful and independently testable against Core alone, exactly like Core's own tier-4 modules (`event`, `observation`, `relation`, `effect`, `provenance`, `epistemic`).
 
 `store` depends on `codec` (round 5 correction): `InMemoryStore` is the reference implementation for admissibility, payload validation, and canonical-collision comparison, so it needs the same codec `SqliteMemoryStore` uses — otherwise the two backends could disagree exactly where `MEMORY_LAWS.md` law 15 (storage backends do not own semantic policy) forbids it.
 
-**Provisional rows**: `store` and `sqlite_store`'s Core import lists are provisional until the persisted-record union is pinned at Pass 2 preregistration. The current list covers what's already fixed (`claims_for`, `conflicts_for`, `retrieve`, and persisting `Episode`); it is expected to grow — at minimum `core.error` (for indexing `Error.message` per `MEMORY_ADVERSARIAL_MATRIX.md` FT-01) and possibly `core.provenance`, depending on the final union. (`Inference` needs no separate row — it lives in `core.epistemic`, already listed.) The candidate persisted-record union under discussion:
+**`store` does not depend on `belief`** (Pass 2 correction): `belief_state()` remains a pure function over data a caller already fetched from the store — it is never called *by* the store, and the store never calls it. They are siblings consumed together by a higher orchestration layer outside Memory v0's own scope, not a dependency chain between them.
+
+**Frozen Pass-2 persisted-record union** (`MEMORY_ADVERSARIAL_MATRIX.md` section K, `docs/memory-passes/02-persistence-boundary.md` §2):
 
 ```text
-Observation, Claim, Inference, Contradiction, Resolution,
-Event, Effect, Provenance, Error, Episode, RetentionMark
+type EntityMemoryRecord = (
+    Observation[object] | Claim[object] | Inference[object] | Contradiction
+    | Event | Effect | Provenance | Error | Episode
+)
+
+type NonEntityMemoryRecord = Resolution | RetentionMark
+
+type MemoryRecord = EntityMemoryRecord | NonEntityMemoryRecord
+
+type PersistRecord = (
+    Observation[object] | Claim[object] | Inference[object] | Contradiction
+    | Resolution | Event | Effect | Provenance | Error | RetentionMark
+)
 ```
+
+`PersistRecord` is what generic `persist()` accepts — every `MemoryRecord` except `Episode`, whose mutable append/close semantics require the dedicated `create_episode`/`append_episode`/`close_episode` surface (see "Episode persistence" below) rather than a single call. No other Core or user type is admitted in Memory v0 — explicitly excluded: `State`, `Transition`, `History`, `Trace`, `TraceEntry`, `Transform`, `Pipeline`, `EffectSpec`, `Relation`, `RelationSet`, `AncestorReport`, `WorkingSet`, `RecallCandidate`, `BeliefProjection`, and any arbitrary user type merely carrying `.id`.
 
 ## Persistence boundary
 
-`persist()` does not take `Entity` — persistence eligibility is a Memory-level decision, independent of Core's `Entity` protocol (`Resolution` and `RetentionMark` are admissible despite carrying no `Id`; nothing in Memory promises to persist every `Entity` Core can produce). The exact admissible-record union type is pinned at Pass 2 preregistration.
+`persist()` does not take `Entity` — persistence eligibility is a Memory-level decision, independent of Core's `Entity` protocol (`Resolution` and `RetentionMark` are admissible despite carrying no `Id`; nothing in Memory promises to persist every `Entity` Core can produce). The exact admissible-record union (`PersistRecord`) is frozen above.
+
+**Persistence is closed over directly embedded admissible Entity records** (Pass 2): two admitted structures embed other identified admissible records directly — `Inference.conclusion → Claim` and `Error.cause → Error | None`. Persisting an `Inference` atomically registers its `conclusion` `Claim` too, participating normally in `resolve()`/`claims_for()`/collision detection/lexical retrieval; persisting an `Error` recursively registers its Core `cause` chain, each independently resolvable by its own `Id`. This is structural (only these two specifically-defined fields), never generic reflection over arbitrary Python objects. `Error.exception` (a foreign `BaseException`) has no Memory v0 codec — an `Error` with `exception is not None` is rejected with `UnsupportedPersistedValue` rather than reduced to a type name, message, `repr()`, or pickle, none of which is the original semantic object.
+
+**Atomicity**: each public mutating store operation validates and canonicalizes its complete operation — including any embedded records — before mutating any state. A `persist(Inference(...))` whose embedded `Claim` is fine but whose `Inference` itself collides leaves neither newly registered. No partial registration; this is the reference behavior Pass 3's SQLite transactions must reproduce.
 
 Two distinct key regimes:
 
@@ -78,7 +97,11 @@ append-only non-Entity records (Resolution, RetentionMark)
     semantic identity = none — never promoted to Id, never Ref-targetable
 ```
 
-**Identified-record collision policy**: persisting the same `Id` twice with a canonically identical record is idempotent success; persisting a different record under the same `Id` is an explicit collision error. This makes retry-after-failure safe without permitting mutation-by-upsert.
+**Identified-record collision policy**: persisting the same `Id` twice with a canonically identical record is idempotent success; persisting a different record under the same `Id` is an explicit collision error (`IdentityCollision`, a `ValueError` carrying the `Id` and both records' types — never a stringified payload). This makes retry-after-failure safe without permitting mutation-by-upsert. All Entity-bearing records share **one** semantic `Id` namespace — the store does not maintain independent identity universes per concrete Python type, so `Observation(id=X)` followed by `Event(id=X)` is a collision even though they're different types.
+
+**Canonical representation, not Python `==`** (Pass 2): collision comparison uses a private, deterministic canonical `PersistedValue` tree built from every semantically meaningful field of a record, encoded through Pass 1's canonical codec — never the record's own `__eq__`. This matters concretely for `Event`, whose Core equality is Id-only (`Event(id=X, payload="A") == Event(id=X, payload="B")` is `True` in Core). For persistence-collision purposes those two are **not** canonically identical, and the second `persist()` call must raise `IdentityCollision`, not silently succeed. Canonicalization preserves the `Id`/`Ref` distinction, `Ref` namespace, `Known`/`Unknown`, `None`/`False`/`0`, float sign (including `-0.0`), tuple order, mapping-content-independent-of-iteration-order, and every semantic field of `Context` and the record itself. This canonical form is `store.py`'s own private implementation detail, not a new public serialization format.
+
+`UnsupportedMemoryRecord` (a `TypeError` carrying only the offending `type`) is raised when a runtime caller bypasses typing and supplies something outside `PersistRecord` — an arbitrary Core `Entity` not in the union, a plain user object merely carrying `.id`, or an `Episode` passed to generic `persist()` (whose error message directs the caller to `create_episode()` instead).
 
 ## Episode persistence
 
@@ -91,6 +114,16 @@ close episode
 ```
 
 Guaranteed invariants: stored items may only gain a suffix; `closed_at` moves `None → WallInstant` exactly once; existing items never change or reorder; `closed_at`, once set, never changes again. A normalized `episodes` + `episode_items` representation fits this naturally — exact table shape is pass-level detail.
+
+**Frozen Episode store surface** (Pass 2): generic `persist()` never accepts `Episode`. Its store surface is exactly three methods, plus ordinary `resolve()` to read current state:
+
+```python
+def create_episode(self, *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant) -> None: ...
+def append_episode(self, episode: Id | Ref, item: Ref) -> None: ...
+def close_episode(self, episode: Id | Ref, at: WallInstant) -> None: ...
+```
+
+`create_episode()` creates only the header (zero items, open) and enters the Id into the global identity regime: an identical existing header is idempotent success (even if that Episode has since acquired items or been closed — creation identity concerns only the immutable header); a different existing header, or the Id occupied by a non-`Episode`, is `IdentityCollision`. `append_episode()` requires an existing, open Episode (`KeyError` if missing, `TypeError` if the Id names a non-`Episode`, `ValueError` if closed) and never follows the appended `Ref` — self-reference and cycles stay opaque and valid. `close_episode()` requires an existing, open Episode and `at >= opened_at`; a second close, or a close before `opened_at`, is `ValueError`. `resolve(episode.id)` returns a **fresh snapshot** of current state — a caller mutating the returned `Episode` locally never changes the store; only `append_episode()`/`close_episode()` do.
 
 ## The codec boundary
 
@@ -117,7 +150,23 @@ Two responsibilities, kept distinct:
 - `as_persisted_value()` returns a defensive recursive immutable snapshot of validated container data — never a reference to the caller's (possibly still-mutable) input.
 - `list` is rejected even where JSON could encode it — `PersistedValue` uses `tuple`, matching Core's own immutability discipline; no structural auto-conversion from dataclasses or other containers.
 
-**Lexical indexing is a separate concern from persistence, and is further restricted to `Ref`-targetable content** (round 5 correction): `sqlite_store.py` indexes a field in FTS5 only when that field belongs to a record that can itself be a `RecallCandidate.item: Ref` target, and is already `str`-typed in Core's own schema (`Error.message`, since `Error` carries an `Id`), or is an `object`-typed field of such a record whose `PersistedValue` encoding happens to *be* a bare `str`. `Resolution.rationale` and `RetentionMark.rationale` are **not** indexed for generic recall — both records are deliberately non-`Entity`/non-`Ref`-targetable, so a lexical hit on either could never be represented as a `RecallCandidate` without inventing a mapping to some other Entity. Their text remains fully persisted and directly queryable through `conflicts_for()`/retention APIs. Never `str(x)` on anything else, and no recursive search-document extraction from nested structures in v0.
+**Lexical content is a separate concern from persistence, and is restricted to `Ref`-targetable content** (round 5 correction, frozen exactly in Pass 2): only a record that can itself be a `RecallCandidate.item: Ref` target contributes generic recall text — `Resolution.rationale` and `RetentionMark.rationale` are **not** indexed for generic recall, since both records are deliberately non-`Entity`/non-`Ref`-targetable and a lexical hit on either could never be represented as a `RecallCandidate` without inventing a mapping to some other Entity; their text remains fully persisted and directly queryable through `conflicts_for()`/retention APIs instead.
+
+`store.py` owns the frozen extraction rule as shared semantic machinery (not a new Memory construction), `lexical_content(record: EntityMemoryRecord) -> tuple[str, ...]`, called by both `InMemoryStore` and (in Pass 3) `SqliteMemoryStore`'s FTS indexing — one rule, not two independently-maintained ones:
+
+| Record | Contributes |
+|---|---|
+| `Observation` | `value`/`source`/`observer`, each only when already a bare `str` — no descent into tuples/mappings/`Context` |
+| `Claim` | the inner value, only when `value is Known` and it's a bare `str`; `Unknown` contributes nothing |
+| `Inference` | nothing — its `conclusion` `Claim` is independently registered and searchable under its own identity |
+| `Contradiction` | nothing |
+| `Event` | `payload`, only when already a bare `str` |
+| `Effect` | `description` always; `target` when already a bare `str`; never `metadata` |
+| `Provenance` | `transform_name`, `transform_version` |
+| `Error` | `message`; `operation` when not `None`; never `cause`, `exception`, `metadata`, `context` |
+| `Episode` | nothing |
+
+Never `str()`/`repr()` on anything else, and no recursive search-document extraction from nested structures in v0.
 
 ## Contradiction relevance
 
@@ -127,7 +176,24 @@ Core's `Contradiction` has `subject` and `statements: tuple[Ref, ...]`, but no `
 
 This holds even when a Claim in the slot is contested by a statement using a *different* predicate — the slot's claim is still contested, and Memory does not pretend otherwise merely because the other statement used another predicate. SQL only locates the relevant records; `belief_state()` in `belief.py` remains the sole authority for the resulting status.
 
-## Retrieval composes with retention
+## Retrieval query and retrieval
+
+Frozen `RetrievalQuery` (Pass 2):
+
+```python
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RetrievalQuery:
+    context: Context
+    identity: Id | Ref | None = None
+    text: str | None = None
+    include_archived: bool = False
+```
+
+`identity`/`text` require at least one to be supplied (`identity is not None or text is not None`); a supplied `text` must be non-empty. No result limit, no score threshold, no model-generated relevance field — bounding attention is `WorkingSet`'s job, not retrieval's. `identity` and `text` are an OR query: a record matching either is a candidate; a record matching both appears once, with `relevance = (IDENTITY_MATCH, LEXICAL_MATCH)` — that tuple order is deterministic but encodes no numeric ranking.
+
+The lexical query contract, frozen to make membership backend-independent: **literal, case-sensitive substring matching** over the fields `lexical_content()` extracts (see above). No FTS operators (`*`, `OR`, `NEAR`, quotes, parens, hyphens are ordinary characters), no Unicode normalization, no case folding, no stemming, no token inference. Pass 3's FTS5 may accelerate or rank candidate hits, but must post-validate membership against this same literal rule — SQLite syntax never becomes Memory syntax.
+
+`InMemoryStore`'s reference raw order, before retention is applied: the identity-matched entity (if any) first, then remaining lexical matches in first-persistence order; a record matching both appears once. This is a deterministic reference order, not a ranking contract every future backend must reproduce — Pass 3 may rank lexical matches differently, as long as candidate membership and relevance meaning stay identical.
 
 ```text
 backend search
@@ -139,26 +205,34 @@ retention accessibility (RetentionLog.current())
 ordered RecallCandidates
 ```
 
-`RetentionLog.current()` remains the semantic authority for accessibility, regardless of which backend, or which stage of a query pipeline, physically applies the filter. A backend may optimize this internally later, but no implementation may interpret `ACTIVE`/`DEPRIORITIZED`/`ARCHIVED` differently from another. Frozen default retrieval meaning: `ACTIVE` normally eligible; `DEPRIORITIZED` eligible, ordered after `ACTIVE`; `ARCHIVED` excluded by default, recoverable only through an explicit archive-inclusive query. A custom accessibility `Kind` outside these three makes default retrieval fail explicitly (round 5 correction) — it is never silently treated as any of the known three states; the item remains fully queryable through `RetentionLog`'s own API.
+`RetentionLog.current()` remains the semantic authority for accessibility, regardless of which backend, or which stage of a query pipeline, physically applies the filter. A backend may optimize this internally later, but no implementation may interpret `ACTIVE`/`DEPRIORITIZED`/`ARCHIVED` differently from another. Frozen default retrieval meaning, and frozen final partition order (Pass 2): `ACTIVE` raw order, then `DEPRIORITIZED` raw order (eligible, always ordered after `ACTIVE`), then — only when `include_archived=True` — `ARCHIVED` raw order. A custom accessibility `Kind` outside these three makes default retrieval fail explicitly (`ValueError`) — it is never silently treated as any of the known three states; the item remains fully queryable through `RetentionLog`'s own API regardless.
 
 ## `store.py` owns a real implementer, not just a protocol
 
-Following Core's own `EffectSink`/`MemoryEffectSink` precedent (a Capability-like protocol is introduced only alongside a real implementer — law 19), `store.py` owns both:
+Following Core's own `EffectSink`/`MemoryEffectSink` precedent (a Capability-like protocol is introduced only alongside a real implementer — law 19), `store.py` owns both, with the full protocol frozen in Pass 2:
 
 ```python
+@runtime_checkable
 class MemoryStore(Protocol):
-    def persist(self, record: MemoryRecord) -> None: ...
+    def persist(self, record: PersistRecord) -> None: ...
+    def resolve(self, item: Id | Ref) -> EntityMemoryRecord | None: ...
     def retrieve(self, query: RetrievalQuery, *, retrieved_at: WallInstant) -> tuple[RecallCandidate, ...]: ...
-    def claims_for(self, subject: Id | Ref, predicate: Kind) -> tuple[Claim, ...]: ...
+    def claims_for(self, subject: Id | Ref, predicate: Kind) -> tuple[Claim[object], ...]: ...
     def conflicts_for(self, subject: Id | Ref, predicate: Kind) -> tuple[Contradiction | Resolution, ...]: ...
+    def retention_for(self, item: Id | Ref) -> tuple[RetentionMark, ...]: ...
+    def create_episode(self, *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant) -> None: ...
+    def append_episode(self, episode: Id | Ref, item: Ref) -> None: ...
+    def close_episode(self, episode: Id | Ref, at: WallInstant) -> None: ...
 
 class InMemoryStore:
     """A real MemoryStore implementer, and the reference behavior SQLite is checked against."""
 ```
 
-`retrieve()` takes an explicit `retrieved_at: WallInstant` (round 5 correction) — `RecallCandidate.retrieved_at` must come from somewhere, and a store calling a wall clock implicitly would be exactly the hidden-clock problem Core's `Transform.apply()` already solved by taking `clock`/`monotonic_clock` as explicit parameters. The store records retrieval; it does not own a clock capability.
+`resolve()` answers "do you structurally store Entity X, and what is its current representation?" — exact structural access via `identity_of()`, bypassing retention entirely, so an `ARCHIVED` entity remains exactly resolvable even though default `retrieve()` excludes it. `retrieve()` answers "which stored Entities does this retrieval surface under the current accessibility policy?" — a different question. Neither `Resolution` nor `RetentionMark` can be resolved through `resolve()`, since neither is `Entity`-bearing. `claims_for()` performs **no** Context filtering — it returns every stored `Claim` in the structural `(subject, predicate)` slot in first-persistence order, because `belief_state()` determines contradiction relevance from all slot claims *before* Context filtering; filtering here would hide conflicts from Memory's own epistemic projection. `conflicts_for()` walks the conflict history in append order and applies the same relevance rule `belief_state()` itself uses (subject match + at least one statement resolving to a slot claim) — SQL/the store only locates; `belief_state()` remains the sole authority for the resulting status, and neither `conflicts_for()` nor anything in `store.py` ever parses `Resolution.rationale`. `retention_for()` returns matching marks in append order via `identity_of()`, never sorted by `RetentionMark.at` — the store does not invent its own current-accessibility algorithm; where one is needed, it delegates to `RetentionLog`.
 
-`MemoryRecord` (the admissible persisted-record union) and the exact shape of `RetrievalQuery` are pinned at Pass 2 preregistration — the signatures above name the operations already fixed by the specification, not their final Python types. `persist(record: MemoryRecord)` above covers every admissible record *except* `Episode`: `Episode`'s frozen create/append/close transition semantics (see "Episode persistence" above) cannot be expressed as a single generic `persist()` call, so its store surface is a separate, currently unlisted Pass 2 decision — not yet reduced to a signature here (see "Implementation order," Pass 2, and `MEMORY_ADVERSARIAL_MATRIX.md` section Y).
+`retrieve()` takes an explicit `retrieved_at: WallInstant` (round 5 correction) — `RecallCandidate.retrieved_at` must come from somewhere, and a store calling a wall clock implicitly would be exactly the hidden-clock problem Core's `Transform.apply()` already solved by taking `clock`/`monotonic_clock` as explicit parameters. The store records retrieval; it does not own a clock capability, and Pass 2 adds neither a `Clock` nor an `IdSource` to `InMemoryStore` — every identity comes from a supplied record or explicit `create_episode()` arguments.
+
+Pass 2 adds no generic enumeration API (`all_records()`, `scan()`, …) and no mutation beyond `persist()`/the Episode surface — no `delete`/`remove`/`purge`/`overwrite`/`upsert`. Memory law 1 stays structural: retention changes accessibility, never existence.
 
 `belief_state()` and `admit()` stay pure functions over data already in hand — a store's only job is fetching candidates (claims for a slot, relevant conflict records, retrieval matches). Neither is ever reimplemented in SQL.
 
