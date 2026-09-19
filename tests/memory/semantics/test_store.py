@@ -20,6 +20,7 @@ from core.time import WallInstant
 from core.value import Kind, Known, Unknown
 from memory.store import (
     IdentityCollision,
+    InMemoryStore,
     UnsupportedMemoryRecord,
     _canonical_episode_header,  # pyright: ignore[reportPrivateUsage]
     _canonical_record,  # pyright: ignore[reportPrivateUsage]
@@ -186,3 +187,214 @@ class TestImportSideEffects:
             "memory.store",
             patch_targets=("uuid.uuid4", "time.time", "time.monotonic"),
         )
+
+
+class TestPersistBasicEntities:
+    def test_pa_01_supported_observation_persists(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="reading",
+            at=AT, source="sensor-1", context=CTX,
+        )
+        store.persist(obs)
+        assert store.resolve(obs.id) == obs
+
+    def test_pa_04_arbitrary_core_entity_not_in_union_rejected(self) -> None:
+        from core.provenance import Traced
+
+        store = InMemoryStore()
+        with pytest.raises(UnsupportedMemoryRecord):
+            store.persist(Traced(value="x"))  # type: ignore[arg-type]
+
+    def test_pa_05_user_object_with_id_rejected(self) -> None:
+        class FakeEntity:
+            id = Id(Kind("memory.test.fake"), "f1")
+
+        store = InMemoryStore()
+        with pytest.raises(UnsupportedMemoryRecord):
+            store.persist(FakeEntity())  # type: ignore[arg-type]
+
+    def test_pa_06_state_rejected(self) -> None:
+        from core.state import State
+
+        store = InMemoryStore()
+        state = State(subject=SUBJECT, value="x", at=AT, context=CTX)
+        with pytest.raises(UnsupportedMemoryRecord):
+            store.persist(state)  # type: ignore[arg-type]
+
+    def test_episode_passed_to_generic_persist_rejected_with_helpful_message(self) -> None:
+        from memory.episode import Episode
+
+        store = InMemoryStore()
+        episode = Episode(
+            id=Id(Kind("memory.test.episode"), "ep1"), subject=SUBJECT, context=CTX, opened_at=AT
+        )
+        with pytest.raises(UnsupportedMemoryRecord, match="create_episode"):
+            store.persist(episode)  # type: ignore[arg-type]
+
+    def test_resolve_missing_id_returns_none(self) -> None:
+        store = InMemoryStore()
+        assert store.resolve(Id(Kind("memory.test.missing"), "x")) is None
+
+
+class TestIdentityCollision:
+    def test_id_01_first_insertion_succeeds(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        store.persist(claim)
+        assert store.resolve(claim.id) == claim
+
+    def test_id_02_idempotent_identical_retry(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        store.persist(claim)
+        store.persist(claim)  # must not raise
+        assert store.resolve(claim.id) == claim
+
+    def test_id_03_different_representation_same_id_collides(self) -> None:
+        store = InMemoryStore()
+        store.persist(make_claim("c1", value="first"))
+        with pytest.raises(IdentityCollision):
+            store.persist(make_claim("c1", value="second"))
+
+    def test_same_id_across_concrete_types_collides(self) -> None:
+        store = InMemoryStore()
+        shared_kind_value = "shared-id"
+        event = Event(
+            id=Id(Kind("memory.test.shared"), shared_kind_value),
+            kind=EVENT_KIND, at=AT, payload="p",
+        )
+        contradiction = Contradiction(
+            id=Id(Kind("memory.test.shared"), shared_kind_value), subject=SUBJECT,
+            statements=(Ref(id=Id(CLAIM_KIND, "a")), Ref(id=Id(CLAIM_KIND, "b"))),
+            detected_at=AT, context=CTX,
+        )
+        store.persist(event)
+        with pytest.raises(IdentityCollision):
+            store.persist(contradiction)
+
+    def test_failed_collision_leaves_original_untouched(self) -> None:
+        store = InMemoryStore()
+        original = make_claim("c1", value="first")
+        store.persist(original)
+        try:
+            store.persist(make_claim("c1", value="second"))
+        except IdentityCollision:
+            pass
+        assert store.resolve(original.id) == original
+
+    def test_id_04_event_identity_equality_does_not_hide_collision_via_store(self) -> None:
+        store = InMemoryStore()
+        e1 = Event(id=Id(EVENT_KIND, "e1"), kind=EVENT_KIND, at=AT, payload="A")
+        e2 = Event(id=Id(EVENT_KIND, "e1"), kind=EVENT_KIND, at=AT, payload="B")
+        store.persist(e1)
+        with pytest.raises(IdentityCollision):
+            store.persist(e2)
+
+
+class TestPersistDoesNotMutateCallerOrLeakMutation:
+    def test_pa_08_persist_does_not_mutate_source_record(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value="x",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        assert obs.value == "x"  # unchanged
+
+    def test_caller_mutating_a_mutable_payload_after_persist_does_not_change_resolve(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        mutable_source_payload = {"a": 1}
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value=mutable_source_payload,
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        mutable_source_payload["a"] = 999
+        resolved = store.resolve(obs.id)
+        assert resolved is not None
+        assert dict(resolved.value) == {"a": 1}  # type: ignore[arg-type]
+
+    def test_stored_payload_snapshot_is_itself_immutable(self) -> None:
+        from core.observation import Observation
+
+        store = InMemoryStore()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("memory.test.obs"), "o1"), subject=SUBJECT, value={"a": 1},
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        resolved = store.resolve(obs.id)
+        assert resolved is not None
+        with pytest.raises(TypeError):
+            resolved.value["a"] = 2  # type: ignore[index]
+
+
+class TestEmbeddedEntities:
+    def test_persist_inference_with_new_conclusion_registers_both(self) -> None:
+        store = InMemoryStore()
+        claim = make_claim("c1")
+        inference = Inference(
+            id=Id(Kind("memory.test.inference"), "i1"), premises=(),
+            method=Kind("memory.test.m"), conclusion=claim, at=AT,
+        )
+        store.persist(inference)
+        assert store.resolve(claim.id) == claim
+        assert store.resolve(inference.id) == inference
+
+    def test_persist_inference_where_embedded_conclusion_conflicts_fails_atomically(self) -> None:
+        store = InMemoryStore()
+        store.persist(make_claim("c1", value="already stored"))
+        conflicting_claim = make_claim("c1", value="different")
+        inference = Inference(
+            id=Id(Kind("memory.test.inference"), "i1"), premises=(),
+            method=Kind("memory.test.m"), conclusion=conflicting_claim, at=AT,
+        )
+        with pytest.raises(IdentityCollision):
+            store.persist(inference)
+        assert store.resolve(inference.id) is None
+
+    def test_persist_error_with_cause_independently_resolves(self) -> None:
+        store = InMemoryStore()
+        root = Error(id=Id(ERROR_KIND, "root"), kind=ERROR_KIND, message="root", at=AT)
+        wrapping = Error(
+            id=Id(ERROR_KIND, "wrap"), kind=ERROR_KIND, message="wrap", at=AT, cause=root
+        )
+        store.persist(wrapping)
+        resolved_root = store.resolve(root.id)
+        assert resolved_root is not None
+        assert resolved_root.message == "root"  # type: ignore[union-attr]
+
+    def test_persist_error_where_nested_cause_collides_fails_atomically(self) -> None:
+        store = InMemoryStore()
+        store.persist(
+            Error(id=Id(ERROR_KIND, "root"), kind=ERROR_KIND, message="already stored", at=AT)
+        )
+        conflicting_root = Error(
+            id=Id(ERROR_KIND, "root"), kind=ERROR_KIND, message="different", at=AT
+        )
+        wrapping = Error(
+            id=Id(ERROR_KIND, "wrap"), kind=ERROR_KIND, message="wrap", at=AT,
+            cause=conflicting_root,
+        )
+        with pytest.raises(IdentityCollision):
+            store.persist(wrapping)
+        assert store.resolve(wrapping.id) is None
+
+    def test_persist_error_with_foreign_exception_rejected_no_partial_write(self) -> None:
+        from memory.codec import UnsupportedPersistedValue
+
+        store = InMemoryStore()
+        error = Error(
+            id=Id(ERROR_KIND, "err1"), kind=ERROR_KIND, message="m", at=AT,
+            exception=ValueError("boom"),
+        )
+        with pytest.raises(UnsupportedPersistedValue):
+            store.persist(error)
+        assert store.resolve(error.id) is None

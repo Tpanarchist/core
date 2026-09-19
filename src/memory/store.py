@@ -13,6 +13,8 @@ docs/memory-passes/02-persistence-boundary.md (store.py, tier 1).
 
 from __future__ import annotations
 
+import dataclasses
+
 from core.context import Context
 from core.effect import Effect
 from core.epistemic import Claim, Contradiction, Inference, Resolution
@@ -24,6 +26,7 @@ from core.provenance import Provenance
 from core.time import WallInstant
 from core.value import Known, Unknown
 from memory.codec import (
+    UnsupportedPersistedValue,
     as_persisted_value,
     encode_context,
     encode_duration,
@@ -220,7 +223,7 @@ def _canonical_error(error: Error) -> tuple[object, ...]:
     )
 
 
-def _canonical_record(  # pyright: ignore[reportUnusedFunction]
+def _canonical_record(
     record: EntityMemoryRecord,
 ) -> tuple[object, ...]:
     """Canonical PersistedValue-backed representation used for identity-collision
@@ -269,3 +272,178 @@ def _canonical_episode_header(  # pyright: ignore[reportUnusedFunction]
         encode_context(context),
         encode_wall_instant(opened_at),
     )
+
+
+class InMemoryStore:
+    """The semantic reference implementation — authoritative for admissibility,
+    identity collision, exact resolution, claim/conflict lookup, retention
+    history, retrieval eligibility/relevance, and Episode transitions. Mutable,
+    single-writer, not thread-safe (no locks — law 19: no unearned
+    synchronization). Atomicity here means one public method commits its
+    complete semantic mutation or none of it — not multi-thread isolation.
+    """
+
+    def __init__(self) -> None:
+        self._entities: dict[Id, EntityMemoryRecord] = {}
+        self._entity_canonical: dict[Id, tuple[object, ...]] = {}
+        self._entity_order: list[Id] = []
+        self._conflict_entries: list[Contradiction | Resolution] = []
+        self._conflict_ids: set[Id] = set()
+        self._retention_marks: list[RetentionMark] = []
+
+    def _check(self, id: Id, canonical: tuple[object, ...], incoming_type: type[object]) -> str:
+        """Returns 'insert' or 'idempotent'; raises IdentityCollision — never
+        mutates state.
+        """
+        existing = self._entities.get(id)
+        if existing is None:
+            return "insert"
+        if self._entity_canonical[id] == canonical:
+            return "idempotent"
+        raise IdentityCollision(id, type(existing), incoming_type)
+
+    def _commit(self, id: Id, record: EntityMemoryRecord, canonical: tuple[object, ...]) -> None:
+        self._entities[id] = record
+        self._entity_canonical[id] = canonical
+        self._entity_order.append(id)
+
+    def _snapshot_simple_entity(self, record: EntityMemoryRecord) -> EntityMemoryRecord:
+        """Reconstruct a record with every object-typed payload field replaced
+        by its as_persisted_value()-validated snapshot, via dataclasses.replace
+        — never store a reference the caller could later mutate through.
+        """
+        if isinstance(record, Observation):
+            return dataclasses.replace(
+                record,
+                value=as_persisted_value(record.value),
+                source=as_persisted_value(record.source),
+                observer=(
+                    as_persisted_value(record.observer) if record.observer is not None else None
+                ),
+            )
+        if isinstance(record, Event):
+            return dataclasses.replace(record, payload=as_persisted_value(record.payload))
+        if isinstance(record, Effect):
+            return dataclasses.replace(
+                record,
+                target=as_persisted_value(record.target),
+                metadata=(
+                    as_persisted_value(record.metadata) if record.metadata is not None else None
+                ),
+            )
+        # Contradiction and Provenance have no object-typed payload fields.
+        return record
+
+    def _snapshot_claim(self, claim: Claim[object]) -> Claim[object]:
+        if isinstance(claim.value, Known):
+            return dataclasses.replace(claim, value=Known(as_persisted_value(claim.value.value)))
+        return claim  # Unknown carries no payload to snapshot
+
+    def _snapshot_episode(self, episode: Episode) -> Episode:
+        """A fresh, independent Episode with identical observable state —
+        resolve() must never return the live, mutable stored object.
+        """
+        snapshot = Episode(
+            id=episode.id, subject=episode.subject,
+            context=episode.context, opened_at=episode.opened_at,
+        )
+        for ref in episode.items():
+            snapshot.append(ref)
+        if episode.closed_at is not None:
+            snapshot.close(episode.closed_at)
+        return snapshot
+
+    def persist(self, record: PersistRecord) -> None:
+        if isinstance(record, Inference):
+            self._persist_inference(record)
+            return
+        if isinstance(record, Error):
+            self._persist_error(record)
+            return
+        if isinstance(record, Resolution):
+            self._persist_resolution(record)
+            return
+        if isinstance(record, RetentionMark):
+            self._retention_marks.append(record)
+            return
+        if isinstance(record, Claim):
+            stored = self._snapshot_claim(record)
+            canonical = _canonical_claim(stored)
+            action = self._check(stored.id, canonical, Claim)
+            if action == "insert":
+                self._commit(stored.id, stored, canonical)
+            return
+        # Anything else falls through to canonicalization directly — no separate
+        # isinstance guard here: _canonical_record() already raises
+        # UnsupportedMemoryRecord for anything outside the 8 canonicalizable
+        # types, so a redundant pre-check here would only duplicate that check
+        # (and trip Pyright's reportUnnecessaryIsInstance besides).
+        stored = self._snapshot_simple_entity(record)
+        canonical = _canonical_record(stored)
+        action = self._check(stored.id, canonical, type(record))
+        if action == "insert":
+            self._commit(stored.id, stored, canonical)
+            # NOTE(Task 3): Contradiction persistence must also append to
+            # self._conflict_entries/_conflict_ids here.
+
+    def _persist_inference(self, inference: Inference[object]) -> None:
+        stored_claim = self._snapshot_claim(inference.conclusion)
+        claim_canonical = _canonical_claim(stored_claim)
+        claim_action = self._check(stored_claim.id, claim_canonical, Claim)
+
+        stored_inference = dataclasses.replace(inference, conclusion=stored_claim)
+        inference_canonical = _canonical_inference(stored_inference)
+        inference_action = self._check(inference.id, inference_canonical, Inference)
+
+        # Both checks passed without raising — now commit, Claim first (§35).
+        if claim_action == "insert":
+            self._commit(stored_claim.id, stored_claim, claim_canonical)
+        if inference_action == "insert":
+            self._commit(inference.id, stored_inference, inference_canonical)
+
+    def _persist_error(self, error: Error) -> None:
+        if error.exception is not None:
+            raise UnsupportedPersistedValue(
+                (), error.exception, "foreign exceptions are not persistable"
+            )
+        chain: list[Error] = []
+        current: Error | None = error
+        while current is not None:
+            chain.append(current)
+            current = current.cause
+        chain.reverse()  # root cause first
+
+        prepared: list[tuple[Id, Error, tuple[object, ...], str]] = []
+        rebuilt_cause: Error | None = None
+        for original in chain:
+            snapshotted_metadata = (
+                as_persisted_value(original.metadata) if original.metadata is not None else None
+            )
+            stored = dataclasses.replace(
+                original, cause=rebuilt_cause, metadata=snapshotted_metadata
+            )
+            canonical = _canonical_error(stored)
+            action = self._check(stored.id, canonical, Error)
+            prepared.append((stored.id, stored, canonical, action))
+            rebuilt_cause = stored
+
+        for id_, stored, canonical, action in prepared:
+            if action == "insert":
+                self._commit(id_, stored, canonical)
+
+    def _persist_resolution(self, resolution: Resolution) -> None:
+        if resolution.contradiction.id not in self._conflict_ids:
+            raise ValueError(
+                f"Resolution references Contradiction {resolution.contradiction.id!r}, "
+                "which is not recorded in this store's conflict history"
+            )
+        self._conflict_entries.append(resolution)
+
+    def resolve(self, item: Id | Ref) -> EntityMemoryRecord | None:
+        target = item.id if isinstance(item, Ref) else item
+        stored = self._entities.get(target)
+        if stored is None:
+            return None
+        if isinstance(stored, Episode):
+            return self._snapshot_episode(stored)
+        return stored
