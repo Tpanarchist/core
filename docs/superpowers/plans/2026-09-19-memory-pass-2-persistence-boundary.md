@@ -37,7 +37,7 @@
 - Consumes: `core.identity.{Id, Ref}`, `core.context.Context`, `core.time.{WallInstant, Duration}`, `core.value.{Kind, Known, Unknown}`, `core.observation.Observation`, `core.epistemic.{Claim, Inference, Contradiction, Resolution}`, `core.event.Event`, `core.effect.Effect`, `core.provenance.Provenance`, `core.error.Error`, `memory.episode.Episode`, `memory.retention.RetentionMark`, and from `memory.codec`: `as_persisted_value`, `encode_persisted_value`, `encode_kind`, `encode_id`, `encode_namespace`, `encode_ref`, `encode_wall_instant`, `encode_duration`, `encode_context`.
 - Produces (all in `store.py`, consumed by Tasks 2-6): `EntityMemoryRecord`, `NonEntityMemoryRecord`, `MemoryRecord`, `PersistRecord` (type aliases); `IdentityCollision`, `UnsupportedMemoryRecord` (exceptions); `_canonical_record(record: EntityMemoryRecord) -> tuple[object, ...]` (dispatches across the 8 canonicalizable types — Resolution/RetentionMark/Episode never go through it); `_canonical_episode_header(*, subject: Id | Ref, context: Context, opened_at: WallInstant) -> tuple[object, ...]`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/memory/semantics/test_store.py`:
 
@@ -208,12 +208,12 @@ class TestImportSideEffects:
         )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: FAIL/ERROR with `ModuleNotFoundError: No module named 'memory.store'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `src/memory/store.py`:
 
@@ -485,12 +485,12 @@ def _canonical_episode_header(
     )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: PASS (all tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/memory/store.py tests/memory/semantics/test_store.py
@@ -516,7 +516,7 @@ EOF
 
 Before writing code, read `src/memory/store.py` as Task 1 left it — you are appending to it, not starting fresh.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/memory/semantics/test_store.py` (add these imports to the existing top-of-file import block — `identity_of` from `core.identity`, `InMemoryStore` from `memory.store` — rather than as new mid-file statements):
 
@@ -703,12 +703,12 @@ class TestEmbeddedEntities:
         assert store.resolve(error.id) is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: FAIL/ERROR — `ImportError: cannot import name 'InMemoryStore'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to `src/memory/store.py` (add `import dataclasses` and `from core.observation import Observation` — wait, `Observation` is already imported by Task 1 — just add `import dataclasses` to the top-of-file import block, consolidated with the rest, not mid-file):
 
@@ -892,12 +892,12 @@ Also add, near the top-level imports, `from memory.codec import UnsupportedPersi
 
 Note: `Contradiction` persistence (via `persist()`'s final fallthrough branch above) currently only registers the entity itself — it does **not** yet append to `self._conflict_entries`/`self._conflict_ids`. That wiring is Task 3's job (`conflicts_for()` needs it), to keep this task's diff focused on `persist()`/`resolve()`. The `# NOTE(Task 3): ...` comment already left in the code above marks exactly where to add it.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: PASS (all tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/memory/store.py tests/memory/semantics/test_store.py
@@ -921,7 +921,7 @@ EOF
 - Consumes: Task 2's `InMemoryStore`, `_entities`/`_entity_order`; `core.identity.identity_of`.
 - Produces: `InMemoryStore.claims_for(subject, predicate) -> tuple[Claim[object], ...]`, `InMemoryStore.conflicts_for(subject, predicate) -> tuple[Contradiction | Resolution, ...]`. Also wires `Contradiction` persistence into `self._conflict_entries`/`self._conflict_ids` (left as a marked TODO by Task 2).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/memory/semantics/test_store.py` (add `from core.identity import identity_of` to the top-of-file import block if not already present):
 
@@ -1065,12 +1065,12 @@ class TestConflictsFor:
         assert result.count(contradiction) == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: FAIL/ERROR — `AttributeError: 'InMemoryStore' object has no attribute 'claims_for'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `src/memory/store.py`, find the final fallthrough branch inside `persist()` (left by Task 2 with a `# NOTE(Task 3): ...` comment) and wire `Contradiction` persistence into the conflict history — change that branch to:
 
@@ -1129,12 +1129,12 @@ Then add these two methods to `InMemoryStore` (append after `resolve()`):
 
 Add `from core.identity import identity_of` to the top-of-file import block (consolidated with the existing `from core.identity import Id, Ref` line — change it to `from core.identity import Id, Ref, identity_of`). Also add `Kind` to the top-of-file `from core.value import Known, Unknown` line — change it to `from core.value import Kind, Known, Unknown` — since `claims_for`/`conflicts_for`'s `predicate: Kind` parameter is the first bare use of the `Kind` type in this file (earlier code only ever called `encode_kind()` on an already-`Kind`-typed field, never needing the type itself imported).
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: PASS (all tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/memory/store.py tests/memory/semantics/test_store.py
@@ -1158,7 +1158,7 @@ EOF
 - Consumes: Task 2's `InMemoryStore`, `_snapshot_episode`, `_canonical_episode_header`; `memory.episode.Episode`; `core.identity.identity_of`.
 - Produces: `InMemoryStore.retention_for(item) -> tuple[RetentionMark, ...]`, `InMemoryStore.create_episode(*, id, subject, context, opened_at) -> None`, `InMemoryStore.append_episode(episode, item) -> None`, `InMemoryStore.close_episode(episode, at) -> None`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/memory/semantics/test_store.py`:
 
@@ -1296,12 +1296,12 @@ class TestEpisodeStoreSurface:
         assert store.resolve(episode_id).items() == ()  # type: ignore[union-attr]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: FAIL/ERROR — `AttributeError: 'InMemoryStore' object has no attribute 'retention_for'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append these methods to `InMemoryStore` in `src/memory/store.py`:
 
@@ -1351,12 +1351,12 @@ Append these methods to `InMemoryStore` in `src/memory/store.py`:
 
 Note: `create_episode`/`append_episode`/`close_episode` don't add entries to `self._entity_canonical` — that dict is only used by `_check()` for the generic-`persist()` collision path; Episode's own idempotency check uses `_canonical_episode_header` directly against the live stored `Episode`'s own fields, not a cached canonical form. This is intentional (Episode's mutable state means a cached canonical snapshot would go stale on every append/close) — do not "fix" this by trying to keep `_entity_canonical` in sync for Episodes.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: PASS (all tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/memory/store.py tests/memory/semantics/test_store.py
@@ -1380,7 +1380,7 @@ EOF
 - Consumes: Task 2-4's `InMemoryStore` (`_entities`, `_entity_order`, `retention_for`); `memory.recall.{RecallCandidate, IDENTITY_MATCH, LEXICAL_MATCH}`; `memory.retention.{RetentionLog, RetentionMark, ACTIVE, DEPRIORITIZED, ARCHIVED}`.
 - Produces: `lexical_content(record: EntityMemoryRecord) -> tuple[str, ...]`, `RetrievalQuery` (dataclass), `InMemoryStore.retrieve(query, *, retrieved_at) -> tuple[RecallCandidate, ...]`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/memory/semantics/test_store.py`:
 
@@ -1586,12 +1586,12 @@ class TestRetrievalRetention:
             store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: FAIL/ERROR — `ImportError: cannot import name 'lexical_content'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add these imports to the top-of-file import block in `src/memory/store.py` (consolidated, not mid-file): `from dataclasses import dataclass` (if not already present via the `import dataclasses` module-level import — use `dataclasses.dataclass` as the decorator instead to avoid a duplicate import style, i.e. `@dataclasses.dataclass(...)`), and `from memory.recall import IDENTITY_MATCH, LEXICAL_MATCH, RecallCandidate`, `from memory.retention import ACTIVE, ARCHIVED, DEPRIORITIZED, RetentionLog`.
 
@@ -1702,12 +1702,12 @@ Then add `retrieve()` to `InMemoryStore`:
 
 Note the raised `ValueError` for a custom accessibility `Kind` happens even when `include_archived=True` and even for entities that wouldn't otherwise be excluded — this matches the frozen rule that default retrieval never guesses at an unrecognized `Kind`, full stop, rather than only when that specific candidate would otherwise be filtered.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: PASS (all tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/memory/store.py tests/memory/semantics/test_store.py
@@ -1731,7 +1731,7 @@ EOF
 - Consumes: everything from Tasks 1-5.
 - Produces: `MemoryStore` (the `@runtime_checkable` `Protocol`). No new runtime behavior beyond the protocol declaration — this task is about closure and verification.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/memory/semantics/test_store.py`:
 
@@ -1757,12 +1757,12 @@ class TestNoGenericEnumerationOrDelete:
             assert not hasattr(store, name), f"InMemoryStore must not expose {name}()"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: FAIL/ERROR — `ImportError: cannot import name 'MemoryStore'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Add `from typing import Protocol, runtime_checkable` to the top-of-file import block in `src/memory/store.py`.
 
@@ -1795,12 +1795,12 @@ class MemoryStore(Protocol):
 
 Add `from core.value import Kind` if not already present in the top-of-file block (it should already be there from Task 1's `_canonical_*` helpers).
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/memory/semantics/test_store.py -v`
 Expected: PASS (all tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/memory/store.py tests/memory/semantics/test_store.py
@@ -1822,22 +1822,22 @@ EOF
 - Consumes: the full `src/memory/store.py` and its test file from Tasks 1-6.
 - Produces: nothing new — this is Pass 2's checkpoint.
 
-- [ ] **Step 1: Run the full test suite (Core + all Memory)**
+- [x] **Step 1: Run the full test suite (Core + all Memory)**
 
 Run: `uv run pytest -v`
 Expected: PASS — every existing Core test, every Pass-1 Memory test, and every Task 1-6 Pass-2 test green, none skipped/xfail.
 
-- [ ] **Step 2: Run Ruff**
+- [x] **Step 2: Run Ruff**
 
 Run: `uv run ruff check src/memory tests/memory`
 Expected: no findings. Fix any and re-run before proceeding.
 
-- [ ] **Step 3: Run Pyright**
+- [x] **Step 3: Run Pyright**
 
 Run: `uv run pyright src/memory tests/memory`
 Expected: 0 errors in strict mode. Fix any and re-run before proceeding.
 
-- [ ] **Step 4: Manually confirm no forbidden import exists**
+- [x] **Step 4: Manually confirm no forbidden import exists**
 
 Run:
 ```bash
@@ -1845,11 +1845,11 @@ grep -n "^import sqlite3\|^from sqlite3\|memory\.belief\|memory\.sqlite_store\|c
 ```
 Expected: no output.
 
-- [ ] **Step 5: Manually cross-check adversarial matrix coverage**
+- [x] **Step 5: Manually cross-check adversarial matrix coverage**
 
 Cross-check `MEMORY_ADVERSARIAL_MATRIX.md` sections K, L, and the Pass-2-relevant portions of N, O, Q (the parts that don't require SQLite — see the preregistration §46) against `tests/memory/semantics/test_store.py`. Every PA/ID/CL/RR case referenced in the preregistration's §47-54 must be traceable to at least one test (by name or by docstring/comment reference) or a documented, deliberate non-applicability. Record any gap found and close it with an additional test before continuing — do not defer a genuine gap to Pass 3 unless it is explicitly SQLite-specific (matrix items CL-11, M's transaction/reopen/corruption cases, and Q's actual SQLite-vs-reference equivalence check are legitimately Pass 3's job).
 
-- [ ] **Step 6: Commit the closing state (only if Steps 1-5 required fixes)**
+- [x] **Step 6: Commit the closing state (only if Steps 1-5 required fixes)**
 
 If every prior task's commit already left the tree green, this step is a no-op. If Steps 1-5 required corrections, stage exactly those corrections:
 
