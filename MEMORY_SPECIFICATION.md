@@ -2,11 +2,11 @@
 
 Memory is a personal library of derived constructions over Core's closed v0 ontology (`SPECIFICATION.md`, `LAWS.md`, `ARCHITECTURE.md`) — built to answer one question Core deliberately leaves open: what does a persistent reasoning agent need, beyond what Core already represents, to preserve, group, retrieve, bound its attention over, and govern the accessibility of what it has observed and asserted, without inventing a second, competing notion of truth? Memory adds no new ontology primitives. Everything here is either a direct reuse of a Core concept, an operation over Core concepts, or one of five new derived constructions, each earned by a concrete need Core does not meet.
 
-This specification went through four rounds of adversarial correction before being frozen. Each is preserved below as a "round N fix," for the same reason Core preserves its own: the shape of a construction is often only intelligible in light of the counterexample that forced it.
+This specification went through five rounds of adversarial correction before being frozen. Each is preserved below as a "round N fix," for the same reason Core preserves its own: the shape of a construction is often only intelligible in light of the counterexample that forced it.
 
 ## Central rule
 
-Memory persists and retrieves what Core already knows how to represent; it never reimplements what `core.epistemic` already does. `memory.*` depends on `core.*`, never the reverse. Core v0 is closed — nothing here modifies it, even where a gap is found (see round 3, item 1, and `MEMORY_LAWS.md` law 12).
+Memory persists and retrieves Core facts and Memory's own derived records; it never reimplements what `core.epistemic` already does. `memory.*` depends on `core.*`, never the reverse. Core v0 is closed — nothing here modifies it, even where a gap is found (see round 3, item 1, and `MEMORY_LAWS.md` law 12).
 
 ## Vocabulary disposition
 
@@ -65,6 +65,16 @@ Memory persists and retrieves what Core already knows how to represent; it never
 6. An Episode containing a `Ref` to itself, or into a cycle, is preserved opaquely — Episode groups references, it does not recursively interpret them, so self-reference is not inherently an error.
 7. `store.py` owns both `MemoryStore` (the protocol) and `InMemoryStore` (a real implementer) from Pass 2 onward — mirroring Core's own rule that a Capability-like protocol is introduced only alongside a real implementer (Core's `EffectSink`/`MemoryEffectSink` precedent). `InMemoryStore` is also the reference implementation the SQLite backend is checked against.
 
+## Round 5 fix — closing local contradictions found on review of the frozen documents against Core's own code
+
+1. `BeliefProjection` retains `query_context: Context` rather than discarding it after use — Core's own law that context-dependent information carries its context applies to Memory's own operation results, not only to Core's records.
+2. `belief_state()`'s last parameter is `conflict_entries: tuple[Contradiction | Resolution, ...]`, supplied directly (typically from a store's `conflicts_for()`), not a Core `ContradictionLog` — a pure projection should not force its caller to reconstruct a mutable log purely to invoke it.
+3. Generic lexical retrieval indexes only content attached to a record that can actually be a `RecallCandidate.item: Ref` target. `Resolution` and `RetentionMark` are deliberately non-`Entity`, non-`Ref`-targetable — indexing their text for generic recall would require inventing a mapping to some other Entity that doesn't exist. Their text remains fully persisted and queryable through `conflicts_for()`/retention APIs directly; it is simply not exposed through the generic recall path.
+4. `MemoryStore.retrieve()` never reads wall time implicitly — `RecallCandidate.retrieved_at` is supplied by the caller (a `WallInstant` parameter), the same discipline Core's `Transform.apply()` uses for its clocks.
+5. Default retrieval's accessibility filtering fails explicitly when it encounters an accessibility `Kind` it does not recognize as `ACTIVE`/`DEPRIORITIZED`/`ARCHIVED` — it never guesses which of the three known states a custom `Kind` should be treated as. The item and its mark remain fully queryable through direct retention APIs regardless; only the *default*, accessibility-filtered retrieval path refuses to interpret an unrecognized `Kind` on its own.
+6. `PersistedValue`'s `int` member is arbitrary-precision and round-trips exactly — its canonical encoding does not rely on any backend's native integer width (e.g. SQLite's 64-bit `INTEGER`). See `MEMORY_ARCHITECTURE.md`.
+7. `store.py`'s dependency list includes `codec` — `InMemoryStore` is the reference implementation for admissibility, payload validation, and canonical-collision comparison, so it needs the same codec `SqliteMemoryStore` uses; otherwise the two backends could disagree exactly where `MEMORY_LAWS.md` law 15 forbids it.
+
 ## Per-concept specification
 
 ### 1. Episode
@@ -109,7 +119,7 @@ Memory persists and retrieves what Core already knows how to represent; it never
 - **Relations**: `item: Ref` to any `Entity`; consulted by retrieval to filter/order `RecallCandidate`s.
 - **Representation**: `RetentionMark` (concrete, immutable) — `item: Ref`, `accessibility: Kind` (well-known constants `ACTIVE`/`DEPRIORITIZED`/`ARCHIVED`, extensible via `Kind` rather than a closed enum, per Core's own convention), `at: WallInstant`, `rationale: str | None`. `RetentionLog` (concrete, mutable, single-writer, append-only) — an ordered sequence of `RetentionMark`.
 - **Operations**: `RetentionLog.record(mark)`; `.current(item: Id | Ref) -> Kind` (defaults to `ACTIVE` when no mark exists); `.history(item: Id | Ref) -> tuple[RetentionMark, ...]`.
-- **Default retrieval meaning** (frozen, round 4): `ACTIVE` — normal default eligibility. `DEPRIORITIZED` — eligible, ordered after `ACTIVE` results. `ARCHIVED` — excluded from default retrieval; recoverable only through an explicit archive-inclusive query.
+- **Default retrieval meaning** (frozen, round 4): `ACTIVE` — normal default eligibility. `DEPRIORITIZED` — eligible, ordered after `ACTIVE` results. `ARCHIVED` — excluded from default retrieval; recoverable only through an explicit archive-inclusive query. A custom `Kind` outside these three (round 5 fix): default retrieval fails explicitly rather than guessing which of the three known states it should be treated as; the mark and item remain fully queryable through `RetentionLog`'s own API regardless.
 - **Counterexample**: `del store[item_id]`. A backend that encounters a custom `Kind` it doesn't recognize and silently treats it as `ACTIVE`.
 
 ### 5. BeliefProjection
@@ -129,9 +139,9 @@ Memory persists and retrieves what Core already knows how to represent; it never
   ```
 
   A `Contradiction` is relevant to a `(subject, predicate)` slot when its `subject` matches and at least one of its `statements` resolves to a `Claim` in that slot. `Resolution.rationale` is never inspected as structured data, regardless of its contents. Candidate cardinality and conflict status are independent — a slot can have zero locally available candidates and still report a conflict status, if conflict history references it.
-- **Relations**: reads Core's `Claim`, `Contradiction`, `Resolution`, `ContradictionLog`; never writes them.
-- **Representation**: concrete, immutable structure — `subject: Id | Ref`, `predicate: Kind`, `status: Kind` (`DETERMINED | AMBIGUOUS | UNRESOLVED_CONFLICT | RESOLVED_OPAQUE_CONFLICT | UNKNOWN`), `candidates: tuple[Claim, ...]`, `conflict_entries: tuple[Contradiction | Resolution, ...]` (in log order).
-- **Operations**: `belief_state(subject, predicate, query_context, claims, contradiction_log) -> BeliefProjection`.
+- **Relations**: reads Core's `Claim`, `Contradiction`, `Resolution`; never writes them.
+- **Representation**: concrete, immutable structure — `subject: Id | Ref`, `predicate: Kind`, `query_context: Context`, `status: Kind` (`DETERMINED | AMBIGUOUS | UNRESOLVED_CONFLICT | RESOLVED_OPAQUE_CONFLICT | UNKNOWN`), `candidates: tuple[Claim, ...]`, `conflict_entries: tuple[Contradiction | Resolution, ...]` (in log order). `query_context` is retained, not discarded after use — it determined the result, and Core's own law that context-dependent information carries its context applies here too (round 5 fix).
+- **Operations**: `belief_state(subject, predicate, query_context, claims, conflict_entries) -> BeliefProjection`, where `conflict_entries: tuple[Contradiction | Resolution, ...]` is supplied directly by the caller (typically the store's `conflicts_for()`) rather than reconstructed as a Core `ContradictionLog` — `belief_state()` never requires its caller to rebuild a log purely to call a pure projection (round 5 fix).
 - **Counterexample**: `max(claims, key=lambda c: c.at)` to pick between two birth-date `Claim`s. `if "claim B" in resolution.rationale: ...`.
 
 ## Persistence and the codec boundary
@@ -153,16 +163,24 @@ Persistence is governed by three commitments, realized in `MEMORY_ARCHITECTURE.m
 
 ## Derived constructions
 
+The five new derived constructions this specification adds (`RetentionMark`/`RetentionLog` counted as one pair, the Retention construction):
+
 | Construction | Built from |
 |---|---|
 | `Episode` | `Id` + `subject: Id \| Ref` + `Context` + ordered `Ref` items + `WallInstant` open/close |
 | `RecallCandidate` | `Ref` + `Context` + `relevance: tuple[Kind, ...]` + `WallInstant` |
 | `WorkingSet` | `capacity: int` + `admitted: tuple[RecallCandidate, ...]` |
-| `RetentionMark` | `Ref` + `accessibility: Kind` + `WallInstant` + optional `rationale` |
-| `RetentionLog` | append-only sequence of `RetentionMark`, plus a last-mark-wins projection |
-| `BeliefProjection` | `Id \| Ref` + `Kind` (predicate) + `Kind` (status) + `tuple[Claim, ...]` + `tuple[Contradiction \| Resolution, ...]` |
-| `PersistedValue` | `None \| bool \| int \| float \| str \| bytes \| tuple[PersistedValue, ...] \| Mapping[str, PersistedValue]` — a semantic value-domain refinement, same category as Core's `Kind`/`Maybe` |
-| `MemoryStore` | a narrow persistence/query protocol — Capability-like, realized alongside a real implementer (`InMemoryStore`), per law 19 |
+| `RetentionMark` / `RetentionLog` | `Ref` + `accessibility: Kind` + `WallInstant` + optional `rationale`, held in an append-only sequence with a last-mark-wins projection |
+| `BeliefProjection` | `Id \| Ref` + `Kind` (predicate) + `Context` (query) + `Kind` (status) + `tuple[Claim, ...]` + `tuple[Contradiction \| Resolution, ...]` |
+
+## Supporting semantic/runtime machinery
+
+Not counted among the five constructions above — one is a value-domain refinement (the same category as Core's own `Kind`/`Maybe`), the other a Capability-like protocol (the same category as Core's own `EffectSink`), neither a new ontological answer to "what is memory":
+
+| Item | Category | Built from |
+|---|---|---|
+| `PersistedValue` | semantic value-domain refinement | `None \| bool \| int \| float \| str \| bytes \| tuple[PersistedValue, ...] \| Mapping[str, PersistedValue]` |
+| `MemoryStore` | Capability-like protocol | a narrow persistence/query interface, realized alongside a real implementer (`InMemoryStore`), per law 19 |
 
 ## Principles frozen for the implementation
 

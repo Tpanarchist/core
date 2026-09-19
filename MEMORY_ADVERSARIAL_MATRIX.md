@@ -220,7 +220,7 @@ else
 | CD-01 | `None` | Round-trip exactly |
 | CD-02 | `False` and integer `0` | Remain distinguishable |
 | CD-03 | `True` and integer `1` | Remain distinguishable |
-| CD-04 | Large positive Python int beyond SQLite 64-bit range | Round-trip exactly or fail by explicit codec rule; never truncate |
+| CD-04 | Large positive Python int beyond SQLite 64-bit range | **Frozen v0 rule** (round 5): round-trips exactly, via a canonical width-independent encoding — never truncated, never delegated to SQLite's native `INTEGER` |
 | CD-05 | Large negative Python int | Same |
 | CD-06 | Unicode string | Preserve exact code points |
 | CD-07 | Two canonically equivalent but differently encoded Unicode strings | Do not silently normalize |
@@ -411,7 +411,7 @@ For testing, `InMemoryStore` (from Pass 2) is the deliberately simple reference 
 | RR-03 | Explicit archive-inclusive query | May retrieve archived item |
 | RR-04 | ARCHIVED then ACTIVE | Eligible again |
 | RR-05 | DEPRIORITIZED item vs ACTIVE item | Backend-independent accessibility policy determines ordering/filtering |
-| RR-06 | Custom accessibility Kind | No guessed policy |
+| RR-06 | Custom accessibility Kind | **Frozen v0 rule** (round 5): default retrieval fails explicitly — never silently treated as ACTIVE, DEPRIORITIZED, or ARCHIVED; item remains queryable via direct retention APIs |
 | RR-07 | Item has no retention mark | Treat ACTIVE |
 | RR-08 | Retention timestamp order disagrees with append order | Append projection wins |
 | RR-09 | Retrieval finds item, retention excludes it | It does not appear in returned default RecallCandidates |
@@ -430,6 +430,9 @@ DEPRIORITIZED
 
 ARCHIVED
     excluded by default; opt-in retrieval only
+
+any other Kind
+    default retrieval fails explicitly — never guessed as one of the above
 ```
 
 ---
@@ -438,9 +441,9 @@ ARCHIVED
 
 | ID | Scenario | Required behavior |
 |---|---|---|
-| FT-01 | Error.message if Error is admitted | Index exact string |
-| FT-02 | Resolution.rationale | Index exact string |
-| FT-03 | RetentionMark.rationale | Index exact string when present |
+| FT-01 | Error.message if Error is admitted | Index exact string — `Error` carries an `Id`, so a hit is representable as a `RecallCandidate` |
+| FT-02 | Resolution.rationale | **Not indexed for generic recall** (round 5 correction) — `Resolution` is non-`Entity`, so a lexical hit could never be a `RecallCandidate.item: Ref`; text remains queryable directly via `conflicts_for()` |
+| FT-03 | RetentionMark.rationale | **Not indexed for generic recall** (round 5 correction) — same reasoning as FT-02; text remains queryable directly via retention APIs |
 | FT-04 | Observation.value is bare str | Index |
 | FT-05 | Observation.value is int | Do not `str()` and index |
 | FT-06 | Observation.value is nested mapping containing strings | Do not recursively invent search document in v0 |
@@ -842,23 +845,36 @@ from failed retrieval.
 Frozen (adopted into `MEMORY_SPECIFICATION.md`/`MEMORY_ARCHITECTURE.md`):
 
 ```text
-1. RecallCandidate.relevance: non-empty, duplicate Kinds forbidden.
-2. Retention: DEPRIORITIZED is eligible but ordered after ACTIVE;
-   ARCHIVED excluded by default, opt-in only.
-3. PersistedValue float: finite-only; sign preserved exactly (no -0.0 canonicalization).
-4. Persisted container snapshot: defensive recursive snapshot.
-5. Identified duplicate persistence: identical = idempotent; conflicting same Id = error.
-6. Episode self-reference: opaque preservation.
-7. store.py owns MemoryStore (protocol) + InMemoryStore (real implementer), from Pass 2.
+1.  RecallCandidate.relevance: non-empty, duplicate Kinds forbidden.
+2.  Retention: DEPRIORITIZED is eligible but ordered after ACTIVE;
+    ARCHIVED excluded by default, opt-in only; any other Kind makes
+    default retrieval fail explicitly rather than guess (round 5).
+3.  PersistedValue float: finite-only; sign preserved exactly (no -0.0 canonicalization).
+4.  Persisted container snapshot: defensive recursive snapshot.
+5.  Identified duplicate persistence: identical = idempotent; conflicting same Id = error.
+6.  Episode self-reference: opaque preservation.
+7.  store.py owns MemoryStore (protocol) + InMemoryStore (real implementer), from Pass 2;
+    store depends on codec (round 5) so both backends share one validation/collision authority.
+8.  PersistedValue int: arbitrary-precision, round-trips exactly via a canonical
+    width-independent encoding, never a backend's native integer width (round 5).
+9.  BeliefProjection retains query_context; belief_state()'s conflict input is
+    conflict_entries: tuple[Contradiction | Resolution, ...], supplied directly,
+    not a reconstructed ContradictionLog (round 5).
+10. Generic FTS indexing is restricted to Ref-targetable (Entity-bearing) records —
+    Resolution.rationale and RetentionMark.rationale are excluded (round 5; see FT-02/FT-03).
+11. MemoryStore.retrieve() takes an explicit retrieved_at: WallInstant; never an
+    implicit wall-clock read (round 5).
 ```
 
 Still open, deferred to pass preregistration (`MEMORY_ARCHITECTURE.md`):
 
 ```text
-6. Exact persisted-record union — this also finalizes store/sqlite_store dependency edges. (Pass 2)
-8. belief_state duplicate Claim inputs: normalize by Claim Id, or treat caller input literally. (Pass 1)
-9. Store corruption/decode exception shapes. (Pass 3)
-10. Lexical query contract: literal terms vs. exposed FTS syntax. (Pass 3)
+a. Exact persisted-record union — this also finalizes store/sqlite_store dependency edges. (Pass 2)
+b. Episode's create/append/close store surface — persist(record) alone cannot express
+   its frozen one-way transitions; needs its own API shape. (Pass 2)
+c. belief_state duplicate Claim inputs: normalize by Claim Id, or treat caller input literally. (Pass 1)
+d. Store corruption/decode exception shapes. (Pass 3)
+e. Lexical query contract: literal terms vs. exposed FTS syntax. (Pass 3)
 ```
 
 None of the open items requires a new ontology concept. They are implementation semantics to decide when the relevant pass's code is actually being written.
