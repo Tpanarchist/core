@@ -189,11 +189,12 @@ def _decode_node(node: object) -> PersistedValue:
         result: dict[str, PersistedValue] = {}
         map_items = cast(list[object], rest[0])
         for pair in map_items:
+            if not isinstance(pair, list):
+                raise ValueError(f"malformed 'map' entry: {pair!r}")
             pair_list = cast(list[object], pair)
             if not (len(pair_list) == 2 and isinstance(pair_list[0], str)):
                 raise ValueError(f"malformed 'map' entry: {pair!r}")
-            key = pair_list[0]
-            item = pair_list[1]
+            key, item = pair_list[0], pair_list[1]
             result[key] = _decode_node(item)
         return MappingProxyType(result)
     raise ValueError(f"unknown persisted-value tag: {tag!r}")

@@ -305,3 +305,29 @@ class TestCanonicalEncoding:
         ).encode("utf-8")
         with pytest.raises(ValueError):
             decode_persisted_value(malformed)
+
+    def test_decode_map_entry_must_be_list(self) -> None:
+        """Regression: map entry not a list must raise ValueError, not TypeError.
+
+        Tests isinstance() is used (not cast()) for runtime validation.
+        """
+        import json
+
+        # Test with int entry
+        malformed = json.dumps(["memory.persisted_value", 1, ["map", [42]]]).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+        # Test with None entry
+        malformed = json.dumps(
+            ["memory.persisted_value", 1, ["map", [None]]]
+        ).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+        # Test with dict entry
+        malformed = json.dumps(
+            ["memory.persisted_value", 1, ["map", [{"a": 1, "b": 2}]]]
+        ).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
