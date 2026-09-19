@@ -35,10 +35,17 @@ class Entity(Protocol):
     """Structural "has identity" — implemented by anything carrying an ``id: Id``.
 
     A capability expressed without inheritance: nothing needs to subclass
-    ``Entity`` to satisfy it, only to have the attribute.
+    ``Entity`` to satisfy it, only to have the attribute. ``id`` is a
+    read-only property, not a plain protocol variable — protocol variables
+    are readable *and writable* by default, and Core's identity-bearing
+    records are structurally immutable, so this should not tell type
+    checkers that a consumer may assign a new identity through the
+    protocol. A settable attribute on a concrete class still structurally
+    satisfies this (it's strictly more permissive than what's required).
     """
 
-    id: Id
+    @property
+    def id(self) -> Id: ...
 
 
 @dataclass(frozen=True, slots=True)

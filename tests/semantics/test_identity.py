@@ -94,6 +94,20 @@ class TestEntity:
 
         assert not isinstance(NotAThing(), Entity)
 
+    def test_frozen_record_with_id_field_satisfies_entity_statically(self) -> None:
+        # A plain (settable) dataclass field is structurally compatible with
+        # Entity's read-only `id` property — a static regression: if Entity's
+        # `id` ever regresses to a plain (writable) protocol variable, or if
+        # a frozen record's field stops satisfying a read-only property
+        # protocol, pyright catches it here.
+        @dataclass(frozen=True, slots=True)
+        class Thing:
+            id: Id
+
+        thing = Thing(Id(USER, "42"))
+        entity: Entity = thing
+        assert entity.id == thing.id
+
 
 class TestUuidIdSource:
     def test_preserves_kind(self) -> None:
