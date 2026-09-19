@@ -188,6 +188,23 @@ class TestOrdinaryProjection:
         assert result.status == DETERMINED
         assert result.candidates == (claim,)
 
+    def test_bp_12_identical_value_claims_with_distinct_ids_are_ambiguous(self) -> None:
+        # Contrast with bp_13 below: dedup keys strictly on Claim.id, never
+        # on semantic content. Two Claims with distinct Ids but otherwise
+        # identical subject/predicate/context/value are NOT deduped — both
+        # survive as independent candidates, and the projection is AMBIGUOUS.
+        c1 = make_claim("c1", BALANCE, context=ctx(MONDAY), value=900)
+        c2 = make_claim("c2", BALANCE, context=ctx(MONDAY), value=900)
+        result = belief_state(
+            subject=SUBJECT,
+            predicate=BALANCE,
+            query_context=ctx(MONDAY),
+            claims=(c1, c2),
+            conflict_entries=(),
+        )
+        assert result.status == AMBIGUOUS
+        assert set(result.candidates) == {c1, c2}
+
     def test_bp_13_different_claims_sharing_an_id_raise(self) -> None:
         shared_id = Id(CLAIM_KIND, "c1")
         first: Claim[object] = Claim(
@@ -414,14 +431,16 @@ class TestContradiction:
         assert result.status == UNRESOLVED_CONFLICT
         assert result.candidates == (c1,)
 
-    def test_cf_11_empty_candidates_with_relevant_conflict_still_surfaces(self) -> None:
+    def test_cf_11_unreferenced_contradiction_is_not_relevant(self) -> None:
+        # Absence-of-false-positive test, not a positive "conflict with zero
+        # candidates" case (that positive case is covered by
+        # test_cf_relevance_survives_context_filtering above). Neither
+        # statement here resolves to a supplied claim, so this contradiction
+        # is *not* relevant by the frozen rule and must not surface —
+        # paired with cf_10 above, which is the true-positive case.
         contradiction = self._contradiction(
             (Ref(id=Id(CLAIM_KIND, "gone-1")), Ref(id=Id(CLAIM_KIND, "gone-2")))
         )
-        # Neither statement resolves to a supplied claim, so this
-        # contradiction is *not* relevant by the frozen rule — included here
-        # to prove absence of a false positive, paired with cf_10 above for
-        # the true-positive case.
         result = belief_state(
             subject=SUBJECT, predicate=BALANCE, query_context=ctx(MONDAY),
             claims=(), conflict_entries=(contradiction,),
@@ -482,6 +501,40 @@ class TestContradiction:
         )
         assert result.status == RESOLVED_OPAQUE_CONFLICT
         assert result.conflict_entries == (contradiction, resolution1, resolution2)
+
+    def test_cf_06_multiple_relevant_contradictions_all_resolved(self) -> None:
+        # Distinct from cf_12 (one Contradiction, two Resolutions) and x_09
+        # (one resolved Contradiction plus one unresolved): here there are
+        # TWO separate Contradictions for the same (subject, predicate) slot,
+        # each with its own Resolution — none unresolved, so the result is
+        # RESOLVED_OPAQUE_CONFLICT, not UNRESOLVED_CONFLICT.
+        c1 = make_claim("c1", BIRTH_DATE, context=ctx(MONDAY), value="1990-04-12")
+        c2 = make_claim("c2", BIRTH_DATE, context=ctx(MONDAY), value="1991-04-12")
+        c3 = make_claim("c3", BIRTH_DATE, context=ctx(MONDAY), value="1992-04-12")
+        contradiction_a = self._contradiction((Ref(id=c1.id), Ref(id=c2.id)), contra_id="k1")
+        contradiction_b = self._contradiction((Ref(id=c1.id), Ref(id=c3.id)), contra_id="k2")
+        resolution_a = Resolution(
+            contradiction=Ref(id=contradiction_a.id),
+            rationale="first contradiction addressed",
+            resolved_by=AGENT,
+            at=WallInstant(datetime(2024, 1, 2, tzinfo=UTC)),
+        )
+        resolution_b = Resolution(
+            contradiction=Ref(id=contradiction_b.id),
+            rationale="second contradiction addressed",
+            resolved_by=AGENT,
+            at=WallInstant(datetime(2024, 1, 3, tzinfo=UTC)),
+        )
+        result = belief_state(
+            subject=SUBJECT, predicate=BIRTH_DATE, query_context=ctx(MONDAY),
+            claims=(c1, c2, c3),
+            conflict_entries=(contradiction_a, resolution_a, contradiction_b, resolution_b),
+        )
+        assert result.status == RESOLVED_OPAQUE_CONFLICT
+        assert contradiction_a in result.conflict_entries
+        assert resolution_a in result.conflict_entries
+        assert contradiction_b in result.conflict_entries
+        assert resolution_b in result.conflict_entries
 
     def test_cf_14_differing_authority_values_never_compared_to_each_other(self) -> None:
         # Each claim's Context.authority is only ever merged against the query's

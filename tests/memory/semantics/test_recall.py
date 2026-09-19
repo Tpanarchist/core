@@ -12,7 +12,7 @@ import pytest
 from _memory_side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
-from core.identity import Id, Ref
+from core.identity import Entity, Id, Ref
 from core.time import WallInstant
 from core.value import Kind
 from memory.recall import (
@@ -59,6 +59,13 @@ class TestRecallCandidate:
     def test_relevance_order_preserved(self) -> None:
         c = candidate("a", relevance=(LEXICAL_MATCH, IDENTITY_MATCH, CONTEXTUAL_MATCH))
         assert c.relevance == (LEXICAL_MATCH, IDENTITY_MATCH, CONTEXTUAL_MATCH)
+
+    def test_rc_not_entity_bearing_in_v0(self) -> None:
+        # MEMORY_SPECIFICATION.md #2: RecallCandidate is explicitly not
+        # Entity-bearing in v0 — nothing targets a RecallCandidate by Ref,
+        # so it carries no `id` field.
+        c = candidate("a")
+        assert not isinstance(c, Entity)
 
     def test_relevance_is_defensively_tuple_normalized(self) -> None:
         c = RecallCandidate(
@@ -111,6 +118,19 @@ class TestWorkingSetAdmission:
         same = candidate("a")
         working_set, _ = admit((same, same), capacity=2)
         assert working_set.admitted == (same, same)
+        assert len(working_set.admitted) == 2
+
+        # Same-object-reference duplication alone doesn't prove admit()
+        # skips an equality-based dedup path — RecallCandidate is a frozen
+        # dataclass, so two distinct instances built from the same inputs
+        # compare equal (`==`) without being the same object. admit() must
+        # not collapse those either: only caller order/count is preserved.
+        equal_but_distinct = (candidate("b"), candidate("b"))
+        assert equal_but_distinct[0] == equal_but_distinct[1]
+        assert equal_but_distinct[0] is not equal_but_distinct[1]
+        working_set2, _ = admit(equal_but_distinct, capacity=2)
+        assert working_set2.admitted == equal_but_distinct
+        assert len(working_set2.admitted) == 2
 
     def test_ws_09_mutating_input_after_admission_does_not_affect_working_set(self) -> None:
         candidates = [candidate("a"), candidate("b")]

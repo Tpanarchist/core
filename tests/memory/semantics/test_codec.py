@@ -206,6 +206,53 @@ class TestFloats:
             as_persisted_value(float("nan"))
 
 
+class TestFloatDomainAtEncodeBoundary:
+    """`_encode_node`/`_decode_node` must re-enforce the finite-float domain
+    rule directly, not merely rely on `as_persisted_value()` having already
+    checked it — a caller can reach the encode/decode boundary without going
+    through `as_persisted_value()` first (e.g. `_encode_node` is used
+    internally by `encode_context()`/`encode_persisted_value()` alike).
+    """
+
+    def test_encode_positive_infinity_raises(self) -> None:
+        with pytest.raises(UnsupportedPersistedValue):
+            encode_persisted_value(float("inf"))
+
+    def test_encode_negative_infinity_raises(self) -> None:
+        with pytest.raises(UnsupportedPersistedValue):
+            encode_persisted_value(float("-inf"))
+
+    def test_encode_nan_raises(self) -> None:
+        with pytest.raises(UnsupportedPersistedValue):
+            encode_persisted_value(float("nan"))
+
+    def test_decode_well_formed_envelope_carrying_positive_infinity_raises(self) -> None:
+        malformed = _envelope("memory.persisted_value", 1, ["float", "inf"])
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_decode_well_formed_envelope_carrying_negative_infinity_raises(self) -> None:
+        malformed = _envelope("memory.persisted_value", 1, ["float", "-inf"])
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_decode_well_formed_envelope_carrying_nan_raises(self) -> None:
+        malformed = _envelope("memory.persisted_value", 1, ["float", "nan"])
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+
+class TestMappingKeyTypeAtEncodeBoundary:
+    def test_encode_mixed_key_types_raises_unsupported_not_raw_typeerror(self) -> None:
+        """Regression: a raw dict with mixed str/int keys reaching
+        `_encode_node` directly (bypassing `as_persisted_value()`'s own key
+        validation) must raise `UnsupportedPersistedValue`, not a bare
+        `TypeError` from `sorted()` comparing incomparable key types.
+        """
+        with pytest.raises(UnsupportedPersistedValue):
+            encode_persisted_value({"a": 1, 2: "x"})  # type: ignore[dict-item]
+
+
 class TestNoStringificationFallback:
     def test_codec_never_calls_str_or_repr_as_a_fallback(self) -> None:
         class Loud:
@@ -247,8 +294,14 @@ class TestCanonicalEncoding:
         assert first == second
 
     def test_round_trips_every_scalar_kind(self) -> None:
+        # `==`-only comparison can't catch a bool/int collapse (0 == False in
+        # Python), so each value's decoded *type* is also pinned exactly —
+        # mirroring the `type(...) is` discipline already used for
+        # `as_persisted_value()` in TestScalars above.
         for value in (None, True, False, 0, -1, 2**300, 1.5, "s", b"\x00\x01"):
-            assert decode_persisted_value(encode_persisted_value(value)) == value
+            decoded = decode_persisted_value(encode_persisted_value(value))
+            assert decoded == value
+            assert type(decoded) is type(value)
 
     def test_round_trips_nested_containers(self) -> None:
         value = (1, MappingProxyType({"x": (True, None, "y")}), b"z")
@@ -322,6 +375,24 @@ class TestCanonicalEncoding:
 
         malformed = json.dumps(
             ["memory.persisted_value", 1, ["bool", "not a bool"]]
+        ).encode("utf-8")
+        with pytest.raises(ValueError):
+            decode_persisted_value(malformed)
+
+    def test_decode_map_duplicate_key_raises_valueerror(self) -> None:
+        """Regression: a hand-crafted node with a duplicate map key must
+        raise ValueError, not silently last-win. The canonical encoder can
+        never produce this (it sorts a Mapping's unique keys), but a
+        corrupted/hand-crafted byte stream could.
+        """
+        import json
+
+        malformed = json.dumps(
+            [
+                "memory.persisted_value",
+                1,
+                ["map", [["a", ["int", "1"]], ["a", ["int", "2"]]]],
+            ]
         ).encode("utf-8")
         with pytest.raises(ValueError):
             decode_persisted_value(malformed)

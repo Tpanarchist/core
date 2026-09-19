@@ -127,6 +127,8 @@ def _encode_node(value: PersistedValue) -> object:
     if isinstance(value, int):
         return ["int", str(value)]
     if isinstance(value, float):
+        if not math.isfinite(value):
+            raise UnsupportedPersistedValue((), value, "float must be finite")
         return ["float", value.hex()]
     if isinstance(value, str):
         return ["str", value]
@@ -134,7 +136,15 @@ def _encode_node(value: PersistedValue) -> object:
         return ["bytes", base64.b64encode(value).decode("ascii")]
     if isinstance(value, tuple):
         return ["tuple", [_encode_node(item) for item in value]]
-    if isinstance(value, Mapping):  # type: ignore[reportUnnecessaryIsInstance]
+    if isinstance(value, Mapping):  # pyright: ignore[reportUnnecessaryIsInstance]
+        for key in value:
+            # isinstance check is a runtime boundary guard: the annotation says
+            # Mapping[str, PersistedValue], but nothing stops a caller ignoring
+            # static typing from handing back a mapping keyed on something else —
+            # sorted() would then raise an incidental TypeError instead of the
+            # clean UnsupportedPersistedValue this domain boundary promises.
+            if not isinstance(key, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise UnsupportedPersistedValue((), key, "mapping keys must be strings")
         pairs = sorted(value.items(), key=lambda pair: pair[0])
         return ["map", [[key, _encode_node(item)] for key, item in pairs]]
     raise TypeError(f"not a PersistedValue: {type(value).__name__}")
@@ -170,9 +180,12 @@ def _decode_node(node: object) -> PersistedValue:
         if len(rest) != 1 or not isinstance(rest[0], str):
             raise ValueError(f"malformed 'float' node: {node!r}")
         try:
-            return float.fromhex(rest[0])
+            decoded = float.fromhex(rest[0])
         except ValueError as exc:
             raise ValueError(f"malformed 'float' payload: {node!r}") from exc
+        if not math.isfinite(decoded):
+            raise ValueError(f"non-finite float is outside PersistedValue: {node!r}")
+        return decoded
     if tag == "str":
         if len(rest) != 1 or not isinstance(rest[0], str):
             raise ValueError(f"malformed 'str' node: {node!r}")
@@ -201,6 +214,8 @@ def _decode_node(node: object) -> PersistedValue:
             if not (len(pair_list) == 2 and isinstance(pair_list[0], str)):
                 raise ValueError(f"malformed 'map' entry: {pair!r}")
             key, item = pair_list[0], pair_list[1]
+            if key in result:
+                raise ValueError(f"duplicate 'map' key {key!r}: {node!r}")
             result[key] = _decode_node(item)
         return MappingProxyType(result)
     raise ValueError(f"unknown persisted-value tag: {tag!r}")
@@ -214,6 +229,9 @@ def encode_persisted_value(value: PersistedValue) -> bytes:
 
 
 def decode_persisted_value(data: bytes) -> PersistedValue:
+    """Decode canonical bytes produced by ``encode_persisted_value()`` back
+    into a PersistedValue.
+    """
     return _decode_node(_unenvelope("memory.persisted_value", 1, data))
 
 
@@ -244,23 +262,27 @@ def _expect_str(value: object, tag: str) -> str:
 
 
 def _expect_segments(payload: object, tag: str) -> tuple[str, ...]:
+    """Validate that a decoded payload is a list of strings, e.g. Namespace segments."""
     segments = _expect_list(payload, tag)
     return tuple(_expect_str(segment, f"{tag} segment") for segment in segments)
 
 
 def _expect_dict(payload: object, tag: str) -> dict[str, object]:
+    """Validate that a decoded envelope payload is a dict before field lookup."""
     if not isinstance(payload, dict):
         raise ValueError(f"malformed {tag} payload: {payload!r}")
     return cast(dict[str, object], payload)
 
 
 def _expect_key(payload: dict[str, object], key: str, tag: str) -> object:
+    """Fetch a required field from a decoded dict payload, raising ValueError if absent."""
     if key not in payload:
         raise ValueError(f"malformed {tag} payload: missing {key!r} field")
     return payload[key]
 
 
 def _parse_iso_datetime(iso: str, tag: str) -> datetime:
+    """Parse an ISO-8601 payload string into a datetime, raising ValueError if malformed."""
     try:
         return datetime.fromisoformat(iso)
     except ValueError as exc:
@@ -268,20 +290,24 @@ def _parse_iso_datetime(iso: str, tag: str) -> datetime:
 
 
 def encode_kind(kind: Kind) -> bytes:
+    """Canonical byte encoding of a Kind."""
     return _envelope("memory.kind", 1, kind.value)
 
 
 def decode_kind(data: bytes) -> Kind:
+    """Decode canonical bytes back into a Kind."""
     payload = _unenvelope("memory.kind", 1, data)
     value = _expect_str(payload, "memory.kind")
     return Kind(value)
 
 
 def encode_id(value: Id) -> bytes:
+    """Canonical byte encoding of an Id."""
     return _envelope("memory.id", 1, [value.kind.value, value.value])
 
 
 def decode_id(data: bytes) -> Id:
+    """Decode canonical bytes back into an Id."""
     payload = _unenvelope("memory.id", 1, data)
     pair = _expect_list(payload, "memory.id", length=2)
     kind_value = _expect_str(pair[0], "memory.id.kind")
@@ -290,21 +316,25 @@ def decode_id(data: bytes) -> Id:
 
 
 def encode_namespace(namespace: Namespace) -> bytes:
+    """Canonical byte encoding of a Namespace."""
     return _envelope("memory.namespace", 1, list(namespace.segments))
 
 
 def decode_namespace(data: bytes) -> Namespace:
+    """Decode canonical bytes back into a Namespace."""
     payload = _unenvelope("memory.namespace", 1, data)
     return Namespace(_expect_segments(payload, "memory.namespace"))
 
 
 def encode_ref(ref: Ref) -> bytes:
+    """Canonical byte encoding of a Ref, including its namespace when present."""
     namespace_segments = list(ref.namespace.segments) if ref.namespace is not None else None
     payload = [[ref.id.kind.value, ref.id.value], namespace_segments]
     return _envelope("memory.ref", 1, payload)
 
 
 def decode_ref(data: bytes) -> Ref:
+    """Decode canonical bytes back into a Ref."""
     payload = _unenvelope("memory.ref", 1, data)
     outer = _expect_list(payload, "memory.ref", length=2)
     id_pair = _expect_list(outer[0], "memory.ref.id", length=2)
@@ -320,20 +350,24 @@ def decode_ref(data: bytes) -> Ref:
 
 
 def encode_wall_instant(instant: WallInstant) -> bytes:
+    """Canonical byte encoding of a WallInstant as its ISO-8601 form."""
     return _envelope("memory.wall_instant", 1, instant.value.isoformat())
 
 
 def decode_wall_instant(data: bytes) -> WallInstant:
+    """Decode canonical bytes back into a WallInstant."""
     payload = _unenvelope("memory.wall_instant", 1, data)
     iso = _expect_str(payload, "memory.wall_instant")
     return WallInstant(_parse_iso_datetime(iso, "memory.wall_instant"))
 
 
 def encode_duration(duration: Duration) -> bytes:
+    """Canonical byte encoding of a Duration, in nanoseconds."""
     return _envelope("memory.duration", 1, str(duration.nanoseconds))
 
 
 def decode_duration(data: bytes) -> Duration:
+    """Decode canonical bytes back into a Duration."""
     payload = _unenvelope("memory.duration", 1, data)
     raw = _expect_str(payload, "memory.duration")
     try:
@@ -344,6 +378,7 @@ def decode_duration(data: bytes) -> Duration:
 
 
 def encode_context(context: Context) -> bytes:
+    """Canonical byte encoding of a Context, including its PersistedValue-bearing fields."""
     payload: dict[str, object] = {
         "as_of": context.as_of.value.isoformat(),
         "namespace": list(context.namespace.segments) if context.namespace is not None else None,
@@ -362,6 +397,7 @@ def encode_context(context: Context) -> bytes:
 
 
 def decode_context(data: bytes) -> Context:
+    """Decode canonical bytes back into a Context."""
     payload = _unenvelope("memory.context", 1, data)
     payload_dict = _expect_dict(payload, "memory.context")
 
