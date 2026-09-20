@@ -36,7 +36,7 @@ from memory.sqlite_store import (
     _decode_record,  # pyright: ignore[reportPrivateUsage]
     _encode_record,  # pyright: ignore[reportPrivateUsage]
 )
-from memory.store import PersistRecord
+from memory.store import IdentityCollision, PersistRecord
 
 
 class TestNewDatabaseInitialization:
@@ -430,3 +430,259 @@ class TestOperationChecksum:
 
     def test_digest_is_32_bytes(self) -> None:
         assert len(_compute_digest(1, "persist", b"abc")) == 32
+
+
+def _insert_op_row(conn: sqlite3.Connection, seq: int, op_kind: str, payload: bytes) -> None:
+    from memory.sqlite_store import _compute_digest  # pyright: ignore[reportPrivateUsage]
+
+    digest = _compute_digest(seq, op_kind, payload)
+    conn.execute(
+        "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (?, ?, ?, ?)",
+        (seq, op_kind, payload, digest),
+    )
+
+
+def _fresh_v1_schema(path: Path) -> sqlite3.Connection:
+    from memory.sqlite_store import (
+        _SCHEMA_SQL,  # pyright: ignore[reportPrivateUsage]
+        _SCHEMA_VERSION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    conn = sqlite3.connect(str(path))
+    conn.executescript(_SCHEMA_SQL)
+    conn.execute("INSERT INTO memory_meta VALUES ('schema_version', ?)", (_SCHEMA_VERSION,))
+    conn.commit()
+    return conn
+
+
+class TestJournalReplay:
+    def test_replays_a_simple_observation(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "replay1.sqlite"
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="hello", at=AT,
+            source="s", context=CTX,
+        )
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "persist", _encode_persist_op(obs))
+        conn.commit()
+        conn.close()
+
+        store = SqliteMemoryStore(path)
+        # store.resolve() is Task 5's query-delegation surface, not Task 3's --
+        # what Task 3 guarantees is that replay reconstructs self._reference.
+        assert store._reference.resolve(obs.id) == obs  # pyright: ignore[reportPrivateUsage]
+        store.close()
+
+    def test_replays_episode_create_append_close_in_order(self, tmp_path: Path) -> None:
+        from memory.episode import Episode
+        from memory.sqlite_store import (
+            _encode_append_episode_op,  # pyright: ignore[reportPrivateUsage]
+            _encode_close_episode_op,  # pyright: ignore[reportPrivateUsage]
+            _encode_create_episode_op,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        path = tmp_path / "replay2.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        item = Ref(id=Id(Kind("t.item"), "x"))
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(
+            conn, 1, "create_episode",
+            _encode_create_episode_op(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT),
+        )
+        _insert_op_row(conn, 2, "append_episode", _encode_append_episode_op(episode_id, item))
+        _insert_op_row(conn, 3, "close_episode", _encode_close_episode_op(episode_id, AT))
+        conn.commit()
+        conn.close()
+
+        store = SqliteMemoryStore(path)
+        resolved = store._reference.resolve(episode_id)  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (item,)
+        assert resolved.closed_at == AT
+        store.close()
+
+    def test_resolution_before_contradiction_is_corruption(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "orphan-resolution.sqlite"
+        resolution = Resolution(
+            contradiction=Ref(id=Id(Kind("t.contra"), "never-persisted")),
+            rationale="r", resolved_by=AGENT, at=AT,
+        )
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "persist", _encode_persist_op(resolution))
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption) as excinfo:
+            SqliteMemoryStore(path)
+        assert excinfo.value.sequence == 1
+
+    def test_episode_append_after_close_is_corruption(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import (
+            _encode_append_episode_op,  # pyright: ignore[reportPrivateUsage]
+            _encode_close_episode_op,  # pyright: ignore[reportPrivateUsage]
+            _encode_create_episode_op,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        path = tmp_path / "bad-episode-order.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(
+            conn, 1, "create_episode",
+            _encode_create_episode_op(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT),
+        )
+        _insert_op_row(conn, 2, "close_episode", _encode_close_episode_op(episode_id, AT))
+        _insert_op_row(
+            conn, 3, "append_episode",
+            _encode_append_episode_op(episode_id, Ref(id=Id(Kind("t.item"), "x"))),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption):
+            SqliteMemoryStore(path)
+
+    def test_unknown_op_kind_is_corruption(self, tmp_path: Path) -> None:
+        path = tmp_path / "unknown-opkind.sqlite"
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "teleport", b"whatever")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption):
+            SqliteMemoryStore(path)
+
+    def test_checksum_mismatch_is_corruption(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "badchecksum.sqlite"
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        conn = _fresh_v1_schema(path)
+        conn.execute(
+            "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (1, 'persist', ?, ?)",
+            (_encode_persist_op(obs), b"\x00" * 32),  # deliberately wrong digest
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption) as excinfo:
+            SqliteMemoryStore(path)
+        assert excinfo.value.sequence == 1
+
+    def test_payload_tamper_is_corruption(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import (
+            _compute_digest,  # pyright: ignore[reportPrivateUsage]
+            _encode_persist_op,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        path = tmp_path / "tamperedpayload.sqlite"
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        original_payload = _encode_persist_op(obs)
+        original_digest = _compute_digest(1, "persist", original_payload)
+        tampered_payload = original_payload + b"\x00"  # append a byte after digesting
+
+        conn = _fresh_v1_schema(path)
+        conn.execute(
+            "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (1, 'persist', ?, ?)",
+            (tampered_payload, original_digest),
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption):
+            SqliteMemoryStore(path)
+
+    def test_sequence_gap_is_corruption(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "seqgap.sqlite"
+        obs1: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="a", at=AT, source="s", context=CTX,
+        )
+        obs2: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="b", at=AT, source="s", context=CTX,
+        )
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "persist", _encode_persist_op(obs1))
+        _insert_op_row(conn, 3, "persist", _encode_persist_op(obs2))  # gap: 2 is missing
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption):
+            SqliteMemoryStore(path)
+
+    def test_sequence_not_starting_at_one_is_corruption(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "seqstart.sqlite"
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="a", at=AT, source="s", context=CTX,
+        )
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 2, "persist", _encode_persist_op(obs))  # starts at 2, not 1
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption):
+            SqliteMemoryStore(path)
+
+    def test_special_event_regression_survives_replay(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "event-trap.sqlite"
+        e1 = Event(id=Id(Kind("t.event"), "e1"), kind=Kind("t.event"), at=AT, payload="A")
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "persist", _encode_persist_op(e1))
+        conn.commit()
+        conn.close()
+
+        store = SqliteMemoryStore(path)
+        e2 = Event(id=Id(Kind("t.event"), "e1"), kind=Kind("t.event"), at=AT, payload="B")
+        assert e1 == e2, "sanity: Core Event equality really is Id-only"
+        with pytest.raises(IdentityCollision):
+            # Task 3 produces only replay, not the public write path (Task 4) --
+            # exercising this regression through the private reference directly
+            # is exactly what replay is responsible for guaranteeing.
+            store._reference.persist(e2)  # pyright: ignore[reportPrivateUsage]
+        store.close()
+
+    def test_special_embedded_identity_regression_survives_replay(self, tmp_path: Path) -> None:
+        from memory.sqlite_store import _encode_persist_op  # pyright: ignore[reportPrivateUsage]
+
+        path = tmp_path / "embedded-identity.sqlite"
+        claim1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("v"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        inference: Inference[object] = Inference(
+            id=Id(Kind("t.inf"), "i1"), premises=(), method=Kind("t.m"), conclusion=claim1, at=AT,
+        )
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "persist", _encode_persist_op(inference))
+        conn.commit()
+        conn.close()
+
+        store = SqliteMemoryStore(path)
+        claim2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c2"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("v"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        inference_swapped: Inference[object] = Inference(
+            id=Id(Kind("t.inf"), "i1"), premises=(), method=Kind("t.m"), conclusion=claim2, at=AT,
+        )
+        with pytest.raises(IdentityCollision):
+            # See note in test_special_event_regression_survives_replay above:
+            # store.persist() is Task 4's public write path, not Task 3's.
+            store._reference.persist(inference_swapped)  # pyright: ignore[reportPrivateUsage]
+        store.close()
+
+    from core.identity import (
+        Id as _Id,  # noqa: F401  (import already present above; keep for clarity)
+    )

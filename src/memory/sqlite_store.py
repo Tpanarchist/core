@@ -139,13 +139,12 @@ class SqliteMemoryStore:
         present = self._present_required_tables()
         if not present:
             self._initialize_new_database()
+            self._known_entity_ids: set[Id] = set()
             self._reference = InMemoryStore()
         elif present == set(_REQUIRED_TABLES):
             self._validate_existing_schema()
-            # NOTE(Task 3): replace this with real journal replay — the
-            # constructor must reconstruct self._reference (and rebuild FTS)
-            # from the committed journal instead of starting empty.
-            self._reference = InMemoryStore()
+            self._known_entity_ids: set[Id] = set()
+            self._reference = self._replay_journal()
         else:
             self._conn.close()
             raise StoreCorruption(
@@ -205,6 +204,67 @@ class SqliteMemoryStore:
             self._conn.close()
             raise UnsupportedSchemaVersion(found=found, supported=_SUPPORTED_SCHEMA_VERSION)
 
+    def _replay_journal(self) -> InMemoryStore:
+        reference = InMemoryStore()
+        rows = self._conn.execute(
+            "SELECT seq, op_kind, payload, digest FROM memory_ops ORDER BY seq ASC"
+        ).fetchall()
+
+        expected_seq = 1
+        for seq, op_kind, payload, digest in rows:
+            if not isinstance(seq, int) or seq != expected_seq:
+                raise StoreCorruption(
+                    seq if isinstance(seq, int) else None,
+                    f"non-contiguous operation sequence: expected {expected_seq}, found {seq!r}",
+                )
+            if (
+                not isinstance(op_kind, str)
+                or not isinstance(payload, bytes)
+                or not isinstance(digest, bytes)
+            ):
+                raise StoreCorruption(seq, "malformed journal row types")
+            recomputed = _compute_digest(seq, op_kind, payload)
+            if not _digests_match(recomputed, digest):
+                raise StoreCorruption(seq, "operation checksum mismatch")
+
+            try:
+                self._apply_decoded_operation(reference, seq, op_kind, payload)
+            except StoreCorruption:
+                raise
+            except Exception as exc:
+                raise StoreCorruption(
+                    seq, f"replay rejected by reference semantics: {exc}"
+                ) from exc
+
+            expected_seq += 1
+
+        return reference
+
+    def _apply_decoded_operation(
+        self, reference: InMemoryStore, seq: int, op_kind: str, payload: bytes
+    ) -> None:
+        if op_kind == "persist":
+            record = _decode_persist_op(payload, seq=seq)
+            reference.persist(record)
+            self._track_entity_ids_safe(record)
+        elif op_kind == "create_episode":
+            episode_id, subject, context, opened_at = _decode_create_episode_op(payload, seq=seq)
+            reference.create_episode(
+                id=episode_id, subject=subject, context=context, opened_at=opened_at
+            )
+            self._known_entity_ids.add(episode_id)
+        elif op_kind == "append_episode":
+            episode, item = _decode_append_episode_op(payload, seq=seq)
+            reference.append_episode(episode, item)
+        elif op_kind == "close_episode":
+            episode, at = _decode_close_episode_op(payload, seq=seq)
+            reference.close_episode(episode, at)
+        else:
+            raise StoreCorruption(seq, f"unknown operation kind: {op_kind!r}")
+
+    def _track_entity_ids_safe(self, record: PersistRecord) -> None:
+        _track_entity_ids(self._known_entity_ids, record)
+
     def close(self) -> None:
         if self._closed:
             return
@@ -219,16 +279,16 @@ class SqliteMemoryStore:
 _JOURNAL_FORMAT_VERSION = b"memory.sqlite.operation.v1"
 
 
-# NOTE: several private functions below (this one included) have no caller
-# yet within this module -- Task 2 only produces this codec; Tasks 3-4 wire
-# it into replay/persist/create_episode/append_episode/close_episode. Pyright
-# strict's reportUnusedFunction only counts in-module references (a foreign
-# module importing a leading-underscore name, as the tests here do, does not
-# count), so each such function carries an explicit, deliberate
-# reportUnusedFunction suppression rather than a false signal of dead code.
-def _compute_digest(  # pyright: ignore[reportUnusedFunction]
-    seq: int, op_kind: str, payload: bytes
-) -> bytes:
+# NOTE: Task 2 produced this codec with no caller yet within this module --
+# Task 3 (_replay_journal/_apply_decoded_operation below) now calls the
+# digest and decode-side functions, so those carry no suppression anymore.
+# The encode-side functions below (_encode_persist_op and friends) still have
+# no in-module caller until Task 4 wires in the live write path, so those
+# still carry an explicit, deliberate reportUnusedFunction suppression rather
+# than a false signal of dead code. (Pyright strict's reportUnusedFunction
+# only counts in-module references -- a foreign module importing a
+# leading-underscore name, as the tests here do, does not count.)
+def _compute_digest(seq: int, op_kind: str, payload: bytes) -> bytes:
     """SHA-256 over unambiguous, length-prefixed fields — never naive
     concatenation, which would let e.g. op_kind="ab"+payload="c" collide
     with op_kind="a"+payload="bc".
@@ -242,9 +302,7 @@ def _compute_digest(  # pyright: ignore[reportUnusedFunction]
     return h.digest()
 
 
-def _digests_match(  # pyright: ignore[reportUnusedFunction]
-    expected: bytes, actual: bytes
-) -> bool:
+def _digests_match(expected: bytes, actual: bytes) -> bool:
     return hmac.compare_digest(expected, actual)
 
 
@@ -769,9 +827,7 @@ def _encode_persist_op(  # pyright: ignore[reportUnusedFunction]
     return _encode_record(record)
 
 
-def _decode_persist_op(  # pyright: ignore[reportUnusedFunction]
-    data: bytes, *, seq: int | None = None
-) -> PersistRecord:
+def _decode_persist_op(data: bytes, *, seq: int | None = None) -> PersistRecord:
     return _decode_record(data, seq=seq)
 
 
@@ -788,7 +844,7 @@ def _encode_create_episode_op(  # pyright: ignore[reportUnusedFunction]
     return encode_persisted_value(as_persisted_value(tree))
 
 
-def _decode_create_episode_op(  # pyright: ignore[reportUnusedFunction]
+def _decode_create_episode_op(
     data: bytes, *, seq: int | None = None
 ) -> tuple[Id, Id | Ref, Context, WallInstant]:
     node = _expect_tuple(decode_persisted_value(data), seq, "malformed create_episode operation")
@@ -810,9 +866,7 @@ def _encode_append_episode_op(  # pyright: ignore[reportUnusedFunction]
     return encode_persisted_value(as_persisted_value(tree))
 
 
-def _decode_append_episode_op(  # pyright: ignore[reportUnusedFunction]
-    data: bytes, *, seq: int | None = None
-) -> tuple[Id | Ref, Ref]:
+def _decode_append_episode_op(data: bytes, *, seq: int | None = None) -> tuple[Id | Ref, Ref]:
     node = _expect_tuple(decode_persisted_value(data), seq, "malformed append_episode operation")
     if len(node) != 3 or node[0] != "append_episode":
         raise StoreCorruption(seq, "malformed append_episode operation")
@@ -830,7 +884,7 @@ def _encode_close_episode_op(  # pyright: ignore[reportUnusedFunction]
     return encode_persisted_value(as_persisted_value(tree))
 
 
-def _decode_close_episode_op(  # pyright: ignore[reportUnusedFunction]
+def _decode_close_episode_op(
     data: bytes, *, seq: int | None = None
 ) -> tuple[Id | Ref, WallInstant]:
     node = _expect_tuple(decode_persisted_value(data), seq, "malformed close_episode operation")
@@ -843,9 +897,7 @@ def _decode_close_episode_op(  # pyright: ignore[reportUnusedFunction]
     )
 
 
-def _track_entity_ids(  # pyright: ignore[reportUnusedFunction]
-    known_ids: set[Id], record: PersistRecord
-) -> None:
+def _track_entity_ids(known_ids: set[Id], record: PersistRecord) -> None:
     """Extend `known_ids` with every Id that becomes independently
     resolvable by persisting `record` -- including embedded entities
     (Inference.conclusion, Error.cause chain). Resolution/RetentionMark are
