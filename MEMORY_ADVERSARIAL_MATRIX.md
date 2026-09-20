@@ -884,13 +884,25 @@ Frozen (adopted into `MEMORY_SPECIFICATION.md`/`MEMORY_ARCHITECTURE.md`):
 17. belief_state duplicate Claim inputs: same Id + identical content collapses to one
     (first-occurrence position); same Id + different content raises ValueError. (Pass 1,
     shipped in belief.py — recorded here for completeness, not left open.)
+18. Store corruption/decode exception shapes: StoreCorruption(sequence: int | None,
+    reason: str), UnsupportedSchemaVersion(found: str, supported: int), SqliteStoreClosed —
+    all plain RuntimeError subclasses, resource-lifecycle/corruption machinery rather than
+    new Memory concepts. (Pass 3, docs/memory-passes/03-sqlite-backend.md §41-46)
+19. SqliteMemoryStore's durable architecture, dependency edges, and schema shape: an
+    append-only operation journal (memory_meta + memory_ops, each row SHA-256-checksummed;
+    memory_fts as a rebuildable derived index only) is authoritative durable state, not a
+    record-per-table schema — replay reconstructs a fresh InMemoryStore through its public
+    API only, never private internals. Schema version frozen at 1, no migration framework.
+    Query methods (resolve/claims_for/conflicts_for/retention_for/retrieve) delegate to the
+    replayed reference projection in v0. Final dependency row frozen in
+    MEMORY_ARCHITECTURE.md's dependency graph. (Pass 3, docs/memory-passes/03-sqlite-backend.md)
 ```
 
 Still open, deferred to pass preregistration (`MEMORY_ARCHITECTURE.md`):
 
 ```text
-a. Store corruption/decode exception shapes. (Pass 3)
-b. SqliteMemoryStore's exact dependency edges and concrete schema/table shape. (Pass 3)
+(none — Pass 3's preregistration resolved both items previously listed here; Pass 4 is
+architectural closure/audit and is not expected to require new open semantic decisions)
 ```
 
 None of the open items requires a new ontology concept. They are implementation semantics to decide when the relevant pass's code is actually being written.
