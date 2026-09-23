@@ -875,3 +875,97 @@ class TestTransactionFailureRollback:
         conn.close()
         assert count == 1
         reopened.close()
+
+
+class TestQueryDelegation:
+    def test_resolve_missing_returns_none(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "q1.sqlite")
+        assert store.resolve(Id(Kind("t.missing"), "x")) is None
+        store.close()
+
+    def test_claims_for_matches_persisted_claim(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "q2.sqlite")
+        claim: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("v"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(claim)
+        assert store.claims_for(SUBJECT, Kind("t.p")) == (claim,)
+        store.close()
+
+    def test_conflicts_for_matches_persisted_contradiction(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "q3.sqlite")
+        claim: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("v"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(claim)
+        contradiction = Contradiction(
+            id=Id(Kind("t.contra"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=claim.id), Ref(id=Id(Kind("t.claim"), "other"))),
+            detected_at=AT, context=CTX,
+        )
+        store.persist(contradiction)
+        assert contradiction in store.conflicts_for(SUBJECT, Kind("t.p"))
+        store.close()
+
+    def test_retention_for_matches_persisted_mark(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "q4.sqlite")
+        target = Ref(id=Id(Kind("t.item"), "x"))
+        mark = RetentionMark(item=target, accessibility=ACTIVE, at=AT)
+        store.persist(mark)
+        assert store.retention_for(Id(Kind("t.item"), "x")) == (mark,)
+        store.close()
+
+    def test_retrieve_identity_match(self, tmp_path: Path) -> None:
+        from memory.store import RetrievalQuery
+
+        store = SqliteMemoryStore(tmp_path / "q5.sqlite")
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        candidates = store.retrieve(RetrievalQuery(context=CTX, identity=obs.id), retrieved_at=AT)
+        assert len(candidates) == 1
+        assert candidates[0].item.id == obs.id
+        store.close()
+
+    def test_retrieve_text_match(self, tmp_path: Path) -> None:
+        from memory.store import RetrievalQuery
+
+        store = SqliteMemoryStore(tmp_path / "q6.sqlite")
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findable text",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        candidates = store.retrieve(RetrievalQuery(context=CTX, text="findable"), retrieved_at=AT)
+        assert len(candidates) == 1
+        store.close()
+
+    def test_all_query_methods_raise_closed_after_close(self, tmp_path: Path) -> None:
+        from memory.store import RetrievalQuery
+
+        store = SqliteMemoryStore(tmp_path / "q7.sqlite")
+        store.close()
+        with pytest.raises(SqliteStoreClosed):
+            store.resolve(Id(Kind("t.x"), "x"))
+        with pytest.raises(SqliteStoreClosed):
+            store.claims_for(SUBJECT, Kind("t.p"))
+        with pytest.raises(SqliteStoreClosed):
+            store.conflicts_for(SUBJECT, Kind("t.p"))
+        with pytest.raises(SqliteStoreClosed):
+            store.retention_for(Id(Kind("t.x"), "x"))
+        with pytest.raises(SqliteStoreClosed):
+            store.retrieve(
+                RetrievalQuery(context=CTX, identity=Id(Kind("t.x"), "x")), retrieved_at=AT
+            )
+
+
+class TestProtocolConformance:
+    def test_sqlite_memory_store_satisfies_memory_store_protocol(self, tmp_path: Path) -> None:
+        from memory.store import MemoryStore
+
+        store = SqliteMemoryStore(tmp_path / "protocol.sqlite")
+        assert isinstance(store, MemoryStore)
+        store.close()

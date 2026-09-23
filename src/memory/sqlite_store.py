@@ -28,7 +28,7 @@ from core.identity import Id, Ref
 from core.observation import Observation
 from core.provenance import Provenance
 from core.time import WallInstant
-from core.value import Known, Unknown
+from core.value import Kind, Known, Unknown
 from memory.codec import (
     as_persisted_value,
     decode_context,
@@ -46,8 +46,9 @@ from memory.codec import (
     encode_ref,
     encode_wall_instant,
 )
+from memory.recall import RecallCandidate
 from memory.retention import RetentionMark
-from memory.store import InMemoryStore, PersistRecord, lexical_content
+from memory.store import InMemoryStore, PersistRecord, RetrievalQuery, lexical_content
 
 _SCHEMA_VERSION = "1"
 _SUPPORTED_SCHEMA_VERSION = 1
@@ -356,6 +357,30 @@ class SqliteMemoryStore:
         self._require_open()
         self._reference.close_episode(episode, at)
         self._write_operation("close_episode", _encode_close_episode_op(episode, at))
+
+    def resolve(self, item: Id | Ref) -> object:
+        self._require_open()
+        return self._reference.resolve(item)
+
+    def claims_for(self, subject: Id | Ref, predicate: Kind) -> tuple[Claim[object], ...]:
+        self._require_open()
+        return self._reference.claims_for(subject, predicate)
+
+    def conflicts_for(
+        self, subject: Id | Ref, predicate: Kind
+    ) -> tuple[Contradiction | Resolution, ...]:
+        self._require_open()
+        return self._reference.conflicts_for(subject, predicate)
+
+    def retention_for(self, item: Id | Ref) -> tuple[RetentionMark, ...]:
+        self._require_open()
+        return self._reference.retention_for(item)
+
+    def retrieve(
+        self, query: RetrievalQuery, *, retrieved_at: WallInstant
+    ) -> tuple[RecallCandidate, ...]:
+        self._require_open()
+        return self._reference.retrieve(query, retrieved_at=retrieved_at)
 
 
 _JOURNAL_FORMAT_VERSION = b"memory.sqlite.operation.v1"
