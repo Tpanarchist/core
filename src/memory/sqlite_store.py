@@ -47,7 +47,7 @@ from memory.codec import (
     encode_wall_instant,
 )
 from memory.retention import RetentionMark
-from memory.store import InMemoryStore, PersistRecord
+from memory.store import InMemoryStore, PersistRecord, lexical_content
 
 _SCHEMA_VERSION = "1"
 _SUPPORTED_SCHEMA_VERSION = 1
@@ -274,6 +274,88 @@ class SqliteMemoryStore:
     def _require_open(self) -> None:
         if self._closed:
             raise SqliteStoreClosed("this SqliteMemoryStore has been closed")
+
+    def _next_seq(self) -> int:
+        row = self._conn.execute("SELECT MAX(seq) FROM memory_ops").fetchone()
+        current_max = row[0] if row is not None and row[0] is not None else 0
+        return current_max + 1
+
+    def _rebuild_fts(self) -> None:
+        """Full rebuild: clear the derived index, then reinsert one row per
+        string lexical_content() returns for every known Entity, resolved
+        fresh from the reference projection. Correctness-first for v0 — see
+        MEMORY_ARCHITECTURE.md on optimizing this only after backend-
+        equivalence tests prove a replacement.
+        """
+        self._conn.execute("DELETE FROM memory_fts")
+        for entity_id in self._known_entity_ids:
+            entity = self._reference.resolve(entity_id)
+            if entity is None:
+                continue
+            for field_index, text in enumerate(lexical_content(entity)):
+                self._conn.execute(
+                    "INSERT INTO memory_fts(id_kind, id_value, field_index, content) "
+                    "VALUES (?, ?, ?, ?)",
+                    (entity_id.kind.value, entity_id.value, field_index, text),
+                )
+
+    def _write_operation(self, op_kind: str, payload: bytes) -> None:
+        """Shared transaction wrapper for all four mutating methods. The
+        caller has ALREADY applied the operation to self._reference before
+        calling this — that proved semantic legality. This method only
+        durably records it; on any SQLite failure it rolls back and
+        reloads self._reference from the last-committed journal via the
+        same replay path used at open, then re-raises.
+        """
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            seq = self._next_seq()
+            digest = _compute_digest(seq, op_kind, payload)
+            self._conn.execute(
+                "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (?, ?, ?, ?)",
+                (seq, op_kind, payload, digest),
+            )
+            self._rebuild_fts()
+            self._conn.execute("COMMIT")
+        except Exception:
+            # BEGIN IMMEDIATE itself can be the failing statement (e.g. lock
+            # contention from another writer — this is exactly Matrix case
+            # DB-09). ROLLBACK then has nothing to roll back and would raise
+            # its own "cannot rollback - no transaction is active" error,
+            # masking the real one — verified by direct reproduction during
+            # this plan's pre-flight testing. Guard it with in_transaction.
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+            self._known_entity_ids = set()
+            self._reference = self._replay_journal()
+            raise
+
+    def persist(self, record: PersistRecord) -> None:
+        self._require_open()
+        self._reference.persist(record)
+        self._track_entity_ids_safe(record)
+        self._write_operation("persist", _encode_persist_op(record))
+
+    def create_episode(
+        self, *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant
+    ) -> None:
+        self._require_open()
+        self._reference.create_episode(id=id, subject=subject, context=context, opened_at=opened_at)
+        self._known_entity_ids.add(id)
+        self._write_operation(
+            "create_episode",
+            _encode_create_episode_op(id=id, subject=subject, context=context, opened_at=opened_at),
+        )
+
+    def append_episode(self, episode: Id | Ref, item: Ref) -> None:
+        self._require_open()
+        self._reference.append_episode(episode, item)
+        self._write_operation("append_episode", _encode_append_episode_op(episode, item))
+
+    def close_episode(self, episode: Id | Ref, at: WallInstant) -> None:
+        self._require_open()
+        self._reference.close_episode(episode, at)
+        self._write_operation("close_episode", _encode_close_episode_op(episode, at))
 
 
 _JOURNAL_FORMAT_VERSION = b"memory.sqlite.operation.v1"

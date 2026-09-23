@@ -686,3 +686,192 @@ class TestJournalReplay:
     from core.identity import (
         Id as _Id,  # noqa: F401  (import already present above; keep for clarity)
     )
+
+
+class TestTransactionalPersist:
+    def test_persist_then_resolve(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "persist1.sqlite")
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        assert store._reference.resolve(obs.id) == obs  # pyright: ignore[reportPrivateUsage]
+        store.close()
+
+    def test_persist_survives_close_and_reopen(self, tmp_path: Path) -> None:
+        path = tmp_path / "persist2.sqlite"
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        store = SqliteMemoryStore(path)
+        store.persist(obs)
+        store.close()
+
+        reopened = SqliteMemoryStore(path)
+        assert reopened._reference.resolve(obs.id) == obs  # pyright: ignore[reportPrivateUsage]
+        reopened.close()
+
+    def test_identity_collision_leaves_no_journal_row(self, tmp_path: Path) -> None:
+        path = tmp_path / "collision.sqlite"
+        store = SqliteMemoryStore(path)
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("first"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("second"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(c1)
+        with pytest.raises(IdentityCollision):
+            store.persist(c2)
+        store.close()
+
+        conn = sqlite3.connect(str(path))
+        count = conn.execute("SELECT COUNT(*) FROM memory_ops").fetchone()[0]
+        conn.close()
+        assert count == 1  # only c1's persist op, never c2's rejected attempt
+
+    def test_idempotent_retry_does_not_duplicate_journal_row(self, tmp_path: Path) -> None:
+        path = tmp_path / "idempotent.sqlite"
+        store = SqliteMemoryStore(path)
+        claim: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("v"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(claim)
+        store.persist(claim)  # idempotent retry
+        store.close()
+
+        conn = sqlite3.connect(str(path))
+        count = conn.execute("SELECT COUNT(*) FROM memory_ops").fetchone()[0]
+        conn.close()
+        assert count == 2  # journal records BOTH successful calls (§100) -- it is an
+        # operation log, not a state-delta log; idempotency is a reference-semantics
+        # property (resolve() still returns one Claim), not a journal-compaction rule.
+
+    def test_episode_create_append_close_persist_across_reopen(self, tmp_path: Path) -> None:
+        from memory.episode import Episode
+
+        path = tmp_path / "episode-lifecycle.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        item = Ref(id=Id(Kind("t.item"), "x"))
+        store = SqliteMemoryStore(path)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.append_episode(episode_id, item)
+        store.close_episode(episode_id, AT)
+        store.close()
+
+        reopened = SqliteMemoryStore(path)
+        resolved = reopened._reference.resolve(episode_id)  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (item,)
+        assert resolved.closed_at == AT
+        reopened.close()
+
+    def test_close_then_persist_raises_closed(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "closed.sqlite")
+        store.close()
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        with pytest.raises(SqliteStoreClosed):
+            store.persist(obs)
+
+    def test_close_then_create_episode_raises_closed(self, tmp_path: Path) -> None:
+        store = SqliteMemoryStore(tmp_path / "closed2.sqlite")
+        store.close()
+        with pytest.raises(SqliteStoreClosed):
+            store.create_episode(
+                id=Id(Kind("t.episode"), "ep1"), subject=SUBJECT, context=CTX, opened_at=AT
+            )
+
+
+class _BlockNewOps:
+    """Test-only failure injection: blocks INSERT into memory_ops via a
+    trigger, while SELECT keeps working. VERIFIED before this plan was
+    written that renaming memory_ops away instead (an earlier draft of
+    this test used that) is WRONG -- it also breaks the store's own
+    in-process recovery, since `_write_operation`'s except-handler calls
+    `_replay_journal()`, which itself needs to SELECT from memory_ops to
+    rebuild `self._reference`. Renaming the table away makes recovery
+    itself fail too, silently leaving `self._reference` un-reverted (the
+    bug reproduced during this plan's pre-flight testing: `resolve()`
+    after the "failed" write still returned the supposedly-reverted
+    record). A trigger blocks writes without blocking reads, which is
+    also a more realistic failure shape (a real disk-full or constraint
+    failure blocks the specific write, not all access to the table).
+    Also note: SQLite forbids triggers directly on FTS5 virtual tables --
+    this technique only works on ordinary tables like memory_ops.
+    """
+
+    def __init__(self, store: SqliteMemoryStore) -> None:
+        self._conn = store._conn  # pyright: ignore[reportPrivateUsage]
+
+    def __enter__(self) -> _BlockNewOps:
+        self._conn.execute(
+            "CREATE TRIGGER block_new_ops BEFORE INSERT ON memory_ops "
+            "BEGIN SELECT RAISE(ABORT, 'forced failure for testing'); END;"
+        )
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._conn.execute("DROP TRIGGER block_new_ops")
+
+
+class TestTransactionFailureRollback:
+    def test_forced_sqlite_failure_leaves_reference_at_last_committed_state(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "forced-failure.sqlite"
+        store = SqliteMemoryStore(path)
+        obs1: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="first",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs1)
+
+        obs2: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="second",
+            at=AT, source="s", context=CTX,
+        )
+        with _BlockNewOps(store):
+            with pytest.raises(sqlite3.IntegrityError):
+                store.persist(obs2)
+
+            # Confirm the IN-PROCESS reference already reflects only the
+            # committed state, without any external reconstruction, WHILE
+            # the trigger is still armed (recovery must not need repair
+            # first -- only the specific write was blocked, not reads).
+            assert store._reference.resolve(obs1.id) == obs1  # pyright: ignore[reportPrivateUsage]
+            assert store._reference.resolve(obs2.id) is None  # pyright: ignore[reportPrivateUsage]
+        store.close()
+
+    def test_database_reopen_after_forced_failure_matches_pre_failure_state(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "reopen-after-failure.sqlite"
+        store = SqliteMemoryStore(path)
+        obs1: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="first",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs1)
+
+        obs2: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="second",
+            at=AT, source="s", context=CTX,
+        )
+        with _BlockNewOps(store):
+            with pytest.raises(sqlite3.IntegrityError):
+                store.persist(obs2)
+        store.close()
+
+        reopened = SqliteMemoryStore(path)
+        assert reopened._reference.resolve(obs1.id) == obs1  # pyright: ignore[reportPrivateUsage]
+        assert reopened._reference.resolve(obs2.id) is None  # pyright: ignore[reportPrivateUsage]
+        conn = sqlite3.connect(str(path))
+        count = conn.execute("SELECT COUNT(*) FROM memory_ops").fetchone()[0]
+        conn.close()
+        assert count == 1
+        reopened.close()
