@@ -969,3 +969,202 @@ class TestProtocolConformance:
         store = SqliteMemoryStore(tmp_path / "protocol.sqlite")
         assert isinstance(store, MemoryStore)
         store.close()
+
+
+def _fts_rows(path: Path) -> list[tuple[str, str, int, str]]:
+    conn = sqlite3.connect(str(path))
+    try:
+        return conn.execute(
+            "SELECT id_kind, id_value, field_index, content FROM memory_fts "
+            "ORDER BY id_kind, id_value, field_index"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+class TestFtsIndexing:
+    def test_reopen_rebuilds_fts_from_replayed_state(self, tmp_path: Path) -> None:
+        path = tmp_path / "fts-reopen.sqlite"
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findable text",
+            at=AT, source="s", context=CTX,
+        )
+        store = SqliteMemoryStore(path)
+        store.persist(obs)
+        store.close()
+
+        # Simulate a database whose FTS table was empty on disk for some
+        # reason (e.g. an older writer that never populated it) -- reopening
+        # must rebuild it from the journal-replayed reference, not trust
+        # whatever was (or wasn't) already in memory_fts.
+        conn = sqlite3.connect(str(path))
+        conn.execute("DELETE FROM memory_fts")
+        conn.commit()
+        conn.close()
+        assert _fts_rows(path) == []
+
+        reopened = SqliteMemoryStore(path)
+        rows = _fts_rows(path)
+        # lexical_content(obs) indexes both the str value and the str
+        # source field (field_index 0 and 1 respectively) -- see
+        # lexical_content's Observation branch in memory/store.py.
+        assert rows == [("t.obs", "o1", 0, "findable text"), ("t.obs", "o1", 1, "s")]
+        reopened.close()
+
+    def test_fts_exactness_matches_lexical_content_exactly(self, tmp_path: Path) -> None:
+        from memory.store import lexical_content
+
+        path = tmp_path / "fts-exact.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="hello",
+            at=AT, source="src-text", context=CTX, observer="obs-text",
+        )
+        error = Error(
+            id=Id(ERROR_KIND, "err1"), kind=ERROR_KIND, message="failed hard",
+            at=AT, operation="do-thing",
+        )
+        store.persist(obs)
+        store.persist(error)
+        store.close()
+
+        rows = _fts_rows(path)
+        obs_texts = sorted(r[3] for r in rows if r[0] == "t.obs" and r[1] == "o1")
+        err_texts = sorted(r[3] for r in rows if r[0] == ERROR_KIND.value and r[1] == "err1")
+        assert obs_texts == sorted(lexical_content(obs))
+        assert err_texts == sorted(lexical_content(error))
+
+    def test_non_searchable_fields_never_indexed(self, tmp_path: Path) -> None:
+        path = tmp_path / "fts-nonsearchable.sqlite"
+        store = SqliteMemoryStore(path)
+        # source/observer must also be non-str here, or this would not
+        # actually isolate whether the int `value` is excluded (same
+        # pitfall test_store.py's test_observation_int_value_not_searchable
+        # documents: source="s" would itself produce an indexed row via
+        # lexical_content's source field, unrelated to the int value).
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value=42, at=AT, source=7, context=CTX,
+        )
+        store.persist(obs)
+        contradiction = Contradiction(
+            id=Id(Kind("t.contra"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=Id(Kind("t.claim"), "a")), Ref(id=Id(Kind("t.claim"), "b"))),
+            detected_at=AT, context=CTX,
+        )
+        store.persist(contradiction)
+        resolution_target = Resolution(
+            contradiction=Ref(id=Id(Kind("t.contra"), "never-persisted-alone")),
+            rationale="secret rationale text", resolved_by=AGENT, at=AT,
+        )
+        store.close()
+
+        rows = _fts_rows(path)
+        contents = [r[3] for r in rows]
+        # resolution_target is never persisted at all -- its rationale
+        # documents what a Resolution would carry (matrix section FT-02),
+        # confirmed absent below even though it was never given the chance.
+        assert resolution_target.rationale == "secret rationale text"
+        assert "secret rationale text" not in contents
+        assert not any(r[0] == "t.obs" and r[1] == "o1" for r in rows)  # int value: not indexed
+        assert not any(r[0] == "t.contra" for r in rows)  # Contradiction: not indexed
+
+    def test_archived_item_remains_physically_indexed(self, tmp_path: Path) -> None:
+        from memory.retention import ARCHIVED
+
+        path = tmp_path / "fts-archived.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+        store.close()
+
+        rows = _fts_rows(path)
+        assert any(r[0] == "t.obs" and r[1] == "o1" and r[3] == "findme" for r in rows)
+
+    def test_default_retrieve_still_excludes_archived_despite_fts_row_present(
+        self, tmp_path: Path
+    ) -> None:
+        from memory.retention import ARCHIVED
+        from memory.store import RetrievalQuery
+
+        path = tmp_path / "fts-archived-retrieve.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+        candidates = store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
+        assert candidates == ()
+        store.close()
+
+    def test_collision_rejection_leaves_fts_unchanged(self, tmp_path: Path) -> None:
+        path = tmp_path / "fts-collision.sqlite"
+        store = SqliteMemoryStore(path)
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("original"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(c1)
+        rows_before = _fts_rows(path)
+
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("conflicting"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        with pytest.raises(IdentityCollision):
+            store.persist(c2)
+        store.close()
+
+        rows_after = _fts_rows(path)
+        assert rows_after == rows_before
+        assert any(r[3] == "original" for r in rows_after)
+        assert not any(r[3] == "conflicting" for r in rows_after)
+
+    def test_failed_transaction_leaves_fts_unchanged(self, tmp_path: Path) -> None:
+        path = tmp_path / "fts-failed-txn.sqlite"
+        store = SqliteMemoryStore(path)
+        obs1: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="first",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs1)
+        rows_before = _fts_rows(path)
+
+        obs2: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="second",
+            at=AT, source="s", context=CTX,
+        )
+        with _BlockNewOps(store):
+            with pytest.raises(sqlite3.IntegrityError):
+                store.persist(obs2)
+        store.close()
+
+        rows_after = _fts_rows(path)
+        assert rows_after == rows_before
+
+    def test_idempotent_retry_does_not_duplicate_fts_content(self, tmp_path: Path) -> None:
+        path = tmp_path / "fts-idempotent.sqlite"
+        store = SqliteMemoryStore(path)
+        claim: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("v"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        store.persist(claim)
+        store.persist(claim)
+        store.close()
+
+        rows = [r for r in _fts_rows(path) if r[3] == "v"]
+        assert len(rows) == 1
+
+
+def test_fts5_is_available_in_this_environment() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(content)")
+    finally:
+        conn.close()

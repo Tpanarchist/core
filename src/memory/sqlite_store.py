@@ -146,6 +146,26 @@ class SqliteMemoryStore:
             self._validate_existing_schema()
             self._known_entity_ids: set[Id] = set()
             self._reference = self._replay_journal()
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                self._rebuild_fts()
+                self._conn.execute("COMMIT")
+            except Exception:
+                # BEGIN IMMEDIATE itself can be the failing statement (e.g.
+                # lock contention from another writer -- this is exactly
+                # Matrix case DB-09, and is exercised by
+                # test_db09_second_writer_on_locked_database_fails_explicitly
+                # in Task 7). ROLLBACK then has nothing to roll back and
+                # would raise its own error, masking the real one -- same
+                # fix as _write_operation and _initialize_new_database.
+                # This failure is operational, not a corruption finding --
+                # the journal itself already replayed successfully -- so
+                # the original exception propagates as-is rather than
+                # being wrapped in StoreCorruption.
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
+                self._conn.close()
+                raise
         else:
             self._conn.close()
             raise StoreCorruption(
