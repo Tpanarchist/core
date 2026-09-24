@@ -11,19 +11,20 @@ pytest session. Without this file (and the sibling markers in
 ``tests/architecture/``, ``tests/memory/``, and
 ``tests/memory/architecture/``), the two pairs collide because
 pytest's prepend mode names an unpackaged test module after its bare
-filename alone. See docs/memory-passes/04-architectural-closure.md,
-Task 7's report, for the full incident writeup.
+filename alone. See docs/MEMORY_V0_AUDIT.md, "Incident: pytest
+test-collection basename collision", for the full incident writeup.
 
 Deliberately NOT extended to every directory under ``tests/``:
 ``tests/semantics/``, ``tests/memory/semantics/``,
-``tests/memory/integration/``, and ``tests/personal_finance/`` have no
-basename collisions with each other or with anything above, and their
-test modules rely on pytest's prepend-mode sys.path insertion to
-resolve bare sibling imports (e.g. ``from _side_effects import ...``,
-``from _memory_side_effects import ...``) that only work when a
-directory is left unpackaged. Adding an ``__init__.py`` to any of
-those four directories would break those imports. If a future test
-file introduces a genuine basename collision against one of them,
-add a marker to that specific pair only (as was done here) rather
-than packaging every test directory uniformly.
+``tests/memory/integration/``, and any other test directory whose
+modules rely on bare sibling imports have no basename collisions with
+each other or with anything above, and their test modules rely on
+pytest's prepend-mode sys.path insertion to resolve those bare sibling
+imports (e.g. ``from _side_effects import ...``, ``from
+_memory_side_effects import ...``) that only work when a directory is
+left unpackaged. Adding an ``__init__.py`` to any such directory would
+break those imports. If a future test file introduces a genuine
+basename collision against one of them, add a marker to that specific
+pair only (as was done here) rather than packaging every test
+directory uniformly.
 """

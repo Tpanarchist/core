@@ -11,6 +11,6 @@ real ``memory`` package (``src/memory``) for every other test file
 doing ``from memory.<x> import ...``. Do not remove this file without
 also removing ``tests/memory/architecture/__init__.py`` and
 ``tests/__init__.py`` — the three exist as a set. See
-docs/memory-passes/04-architectural-closure.md, Task 7's report, for
-the shadowing failure this avoids.
+docs/MEMORY_V0_AUDIT.md, "Incident: pytest test-collection basename
+collision", for the shadowing failure this avoids.
 """

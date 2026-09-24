@@ -10,5 +10,6 @@ symmetric, so this (Core's own, frozen) side stays protected against
 any *future* basename clash the same way the Memory side is, rather
 than leaving one half of the pair unpackaged and silently relying on
 the other half never adding a same-named file. See
-docs/memory-passes/04-architectural-closure.md, Task 7's report.
+docs/MEMORY_V0_AUDIT.md, "Incident: pytest test-collection basename
+collision".
 """

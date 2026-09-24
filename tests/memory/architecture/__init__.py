@@ -9,5 +9,6 @@ at the Memory package). Without this marker (plus
 ``tests/__init__.py`` and ``tests/memory/__init__.py``, which must
 exist alongside it — see that file's docstring), pytest cannot
 collect both pairs in the same session: "import file mismatch." See
-docs/memory-passes/04-architectural-closure.md, Task 7's report.
+docs/MEMORY_V0_AUDIT.md, "Incident: pytest test-collection basename
+collision".
 """
