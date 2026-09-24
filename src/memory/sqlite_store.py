@@ -145,7 +145,24 @@ class SqliteMemoryStore:
         elif present == set(_REQUIRED_TABLES):
             self._validate_existing_schema()
             self._known_entity_ids: set[Id] = set()
-            self._reference = self._replay_journal()
+            try:
+                self._reference = self._replay_journal()
+            except Exception:
+                # _replay_journal() raises StoreCorruption for every kind of
+                # corrupted/malformed durable state (bad sequence, checksum
+                # mismatch, unknown op/record tag, semantic replay rejection,
+                # ...) -- none of its internal raise sites close self._conn,
+                # matching every OTHER constructor failure branch in this
+                # method (_initialize_new_database, _validate_existing_schema,
+                # the FTS-rebuild-after-replay block below, and the partial-
+                # schema branch), all of which close before re-raising. Left
+                # unclosed here, a corrupted database would leave a dangling
+                # open connection behind a constructor call that never
+                # returned an object the caller could call close() on -- on
+                # Windows this actually holds a file lock, confirmed by
+                # direct reproduction during this plan's pre-flight testing.
+                self._conn.close()
+                raise
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 self._rebuild_fts()

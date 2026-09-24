@@ -36,7 +36,7 @@ from memory.sqlite_store import (
     _decode_record,  # pyright: ignore[reportPrivateUsage]
     _encode_record,  # pyright: ignore[reportPrivateUsage]
 )
-from memory.store import IdentityCollision, PersistRecord
+from memory.store import IdentityCollision, InMemoryStore, PersistRecord
 
 
 class TestNewDatabaseInitialization:
@@ -440,6 +440,15 @@ def _insert_op_row(conn: sqlite3.Connection, seq: int, op_kind: str, payload: by
         "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (?, ?, ?, ?)",
         (seq, op_kind, payload, digest),
     )
+
+
+def _journal_op_kinds(path: Path) -> list[str]:
+    conn = sqlite3.connect(str(path))
+    try:
+        rows = conn.execute("SELECT op_kind FROM memory_ops ORDER BY seq").fetchall()
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
 
 
 def _fresh_v1_schema(path: Path) -> sqlite3.Connection:
@@ -1160,6 +1169,838 @@ class TestFtsIndexing:
 
         rows = [r for r in _fts_rows(path) if r[3] == "v"]
         assert len(rows) == 1
+
+    # ---- Gaps closed by this task's own audit: the two existing tests that
+    # gestured at FT-02/FT-03 (test_non_searchable_fields_never_indexed)
+    # never actually persisted a Resolution or a RetentionMark with a
+    # rationale through the store -- its own comment said as much ("confirmed
+    # absent below even though it was never given the chance"). These
+    # actually persist one and check its rationale text is absent from FTS. ----
+
+    def test_ft02_resolution_rationale_never_indexed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ft02.sqlite"
+        store = SqliteMemoryStore(path)
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("v1"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c2"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("v2"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        contradiction = Contradiction(
+            id=Id(Kind("t.contra"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=c1.id), Ref(id=c2.id)), detected_at=AT, context=CTX,
+        )
+        resolution = Resolution(
+            contradiction=Ref(id=contradiction.id),
+            rationale="unmistakable resolution rationale text",
+            resolved_by=AGENT, at=AT,
+        )
+        store.persist(c1)
+        store.persist(c2)
+        store.persist(contradiction)
+        store.persist(resolution)  # actually persisted, unlike the earlier weaker test
+        store.close()
+
+        contents = [r[3] for r in _fts_rows(path)]
+        assert "unmistakable resolution rationale text" not in contents
+
+    def test_ft03_retention_mark_rationale_never_indexed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ft03.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.persist(RetentionMark(
+            item=Ref(id=obs.id), accessibility=ACTIVE, at=AT,
+            rationale="unmistakable retention rationale text",
+        ))
+        store.close()
+
+        contents = [r[3] for r in _fts_rows(path)]
+        assert "unmistakable retention rationale text" not in contents
+        assert "findme" in contents  # sanity: the Observation itself WAS indexed
+
+    def test_ft06_nested_mapping_strings_not_recursively_indexed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ft06.sqlite"
+        store = SqliteMemoryStore(path)
+        effect = Effect(
+            id=Id(Kind("t.effect"), "f1"), kind=Kind("t.k"), description="the description",
+            target="the target", at=AT, context=CTX,
+            metadata={"nested": "unmistakable nested metadata string"},
+        )
+        store.persist(effect)
+        store.close()
+
+        contents = [r[3] for r in _fts_rows(path)]
+        assert "unmistakable nested metadata string" not in contents
+        assert "the description" in contents
+        assert "the target" in contents
+
+    def test_ft07_event_bare_string_payload_indexed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ft07.sqlite"
+        store = SqliteMemoryStore(path)
+        event = Event(
+            id=Id(Kind("t.event"), "e1"), kind=Kind("t.event"), at=AT,
+            payload="findable event payload",
+        )
+        store.persist(event)
+        store.close()
+
+        rows = _fts_rows(path)
+        assert any(
+            r[0] == "t.event" and r[1] == "e1" and r[3] == "findable event payload" for r in rows
+        )
+
+    def test_ft08_event_bytes_payload_not_indexed(self, tmp_path: Path) -> None:
+        path = tmp_path / "ft08.sqlite"
+        store = SqliteMemoryStore(path)
+        event = Event(
+            id=Id(Kind("t.event"), "e1"), kind=Kind("t.event"), at=AT, payload=b"raw bytes payload",
+        )
+        store.persist(event)
+        store.close()
+
+        rows = _fts_rows(path)
+        assert not any(r[0] == "t.event" and r[1] == "e1" for r in rows)
+
+    def test_ft10_fts_operator_like_query_text_remains_literal_substring(
+        self, tmp_path: Path
+    ) -> None:
+        from memory.store import RetrievalQuery
+
+        path = tmp_path / "ft10.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT,
+            value='has "quotes" and a * star and NEAR() text', at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        literal_hit = store.retrieve(
+            RetrievalQuery(context=CTX, text='"quotes" and a * star'), retrieved_at=AT
+        )
+        assert len(literal_hit) == 1
+        no_hit = store.retrieve(
+            RetrievalQuery(context=CTX, text="unrelated wildcard*query"), retrieved_at=AT
+        )
+        assert no_hit == ()
+        store.close()
+
+
+class TestBackendEquivalence:
+    """Matrix section Q (BE-01..08): the same operation trace against
+    InMemoryStore and SqliteMemoryStore must produce identical observable
+    results. Matrix section O (RR-01..12) and N (CL-11) are proven the same
+    way -- SqliteMemoryStore.retrieve()/conflicts_for() delegate wholesale
+    to the replayed reference (prereg §30-31), so equivalence here IS the
+    proof that SQLite reproduces InMemoryStore's already-frozen retrieval/
+    retention/conflict policy, not a second independent policy check.
+    """
+
+    def _paired_stores(self, tmp_path: Path) -> tuple[InMemoryStore, SqliteMemoryStore]:
+        reference = InMemoryStore()
+        durable = SqliteMemoryStore(tmp_path / "equivalence.sqlite")
+        return reference, durable
+
+    def test_ordinary_records_equivalent(self, tmp_path: Path) -> None:
+        reference, durable = self._paired_stores(tmp_path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        reference.persist(obs)
+        durable.persist(obs)
+        assert reference.resolve(obs.id) == durable.resolve(obs.id)
+        durable.close()
+
+    def test_idempotent_retries_equivalent(self, tmp_path: Path) -> None:
+        reference, durable = self._paired_stores(tmp_path)
+        claim: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("v"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        for store in (reference, durable):
+            store.persist(claim)
+            store.persist(claim)
+        ref_claims = reference.claims_for(SUBJECT, Kind("t.p"))
+        dur_claims = durable.claims_for(SUBJECT, Kind("t.p"))
+        assert ref_claims == dur_claims
+        durable.close()
+
+    def test_identity_collisions_equivalent(self, tmp_path: Path) -> None:
+        reference, durable = self._paired_stores(tmp_path)
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("first"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("second"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        for store in (reference, durable):
+            store.persist(c1)
+            with pytest.raises(IdentityCollision):
+                store.persist(c2)
+        durable.close()
+
+    def test_inference_with_embedded_claim_equivalent(self, tmp_path: Path) -> None:
+        reference, durable = self._paired_stores(tmp_path)
+        claim: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("v"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        inference: Inference[object] = Inference(
+            id=Id(Kind("t.inf"), "i1"), premises=(), method=Kind("t.m"), conclusion=claim, at=AT,
+        )
+        for store in (reference, durable):
+            store.persist(inference)
+        assert reference.resolve(claim.id) == durable.resolve(claim.id)
+        assert reference.resolve(inference.id) == durable.resolve(inference.id)
+        durable.close()
+
+    def test_error_cause_chain_equivalent(self, tmp_path: Path) -> None:
+        reference, durable = self._paired_stores(tmp_path)
+        root = Error(id=Id(ERROR_KIND, "root"), kind=ERROR_KIND, message="root", at=AT)
+        wrap = Error(id=Id(ERROR_KIND, "wrap"), kind=ERROR_KIND, message="wrap", at=AT, cause=root)
+        for store in (reference, durable):
+            store.persist(wrap)
+        assert reference.resolve(root.id) == durable.resolve(root.id)
+        assert reference.resolve(wrap.id) == durable.resolve(wrap.id)
+        durable.close()
+
+    def test_contradiction_and_resolutions_equivalent(self, tmp_path: Path) -> None:
+        reference, durable = self._paired_stores(tmp_path)
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("a"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c2"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("b"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        contradiction = Contradiction(
+            id=Id(Kind("t.contra"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=c1.id), Ref(id=c2.id)), detected_at=AT, context=CTX,
+        )
+        r1 = Resolution(
+            contradiction=Ref(id=contradiction.id), rationale="first", resolved_by=AGENT, at=AT
+        )
+        r2 = Resolution(
+            contradiction=Ref(id=contradiction.id), rationale="second", resolved_by=AGENT, at=AT
+        )
+        for store in (reference, durable):
+            store.persist(c1)
+            store.persist(c2)
+            store.persist(contradiction)
+            store.persist(r1)
+            store.persist(r2)
+        ref_conflicts = reference.conflicts_for(SUBJECT, Kind("t.p"))
+        dur_conflicts = durable.conflicts_for(SUBJECT, Kind("t.p"))
+        assert ref_conflicts == dur_conflicts
+        durable.close()
+
+    def test_retention_history_equivalent(self, tmp_path: Path) -> None:
+        from memory.retention import ARCHIVED
+
+        reference, durable = self._paired_stores(tmp_path)
+        target = Id(Kind("t.item"), "x")
+        mark1 = RetentionMark(item=Ref(id=target), accessibility=ACTIVE, at=AT)
+        mark2 = RetentionMark(item=Ref(id=target), accessibility=ARCHIVED, at=AT)
+        for store in (reference, durable):
+            store.persist(mark1)
+            store.persist(mark2)
+        assert reference.retention_for(target) == durable.retention_for(target)
+        durable.close()
+
+    def test_episode_lifecycle_equivalent(self, tmp_path: Path) -> None:
+        from memory.episode import Episode
+
+        reference, durable = self._paired_stores(tmp_path)
+        episode_id = Id(Kind("t.episode"), "ep1")
+        item = Ref(id=Id(Kind("t.item"), "x"))
+        for store in (reference, durable):
+            store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+            store.append_episode(episode_id, item)
+            store.close_episode(episode_id, AT)
+        ref_episode = reference.resolve(episode_id)
+        dur_episode = durable.resolve(episode_id)
+        assert isinstance(ref_episode, Episode)
+        assert isinstance(dur_episode, Episode)
+        assert ref_episode.items() == dur_episode.items()
+        assert ref_episode.closed_at == dur_episode.closed_at
+        durable.close()
+
+    def test_archived_deprioritized_retrieval_equivalent(self, tmp_path: Path) -> None:
+        from memory.retention import DEPRIORITIZED
+        from memory.store import RetrievalQuery
+
+        reference, durable = self._paired_stores(tmp_path)
+        deprioritized_obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme first",
+            at=AT, source="s", context=CTX,
+        )
+        active_obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="findme second",
+            at=AT, source="s", context=CTX,
+        )
+        for store in (reference, durable):
+            store.persist(deprioritized_obs)
+            store.persist(active_obs)
+            store.persist(RetentionMark(
+                item=Ref(id=deprioritized_obs.id), accessibility=DEPRIORITIZED, at=AT
+            ))
+        query = RetrievalQuery(context=CTX, text="findme")
+        ref_candidates = reference.retrieve(query, retrieved_at=AT)
+        dur_candidates = durable.retrieve(query, retrieved_at=AT)
+        assert [c.item.id for c in ref_candidates] == [c.item.id for c in dur_candidates]
+        durable.close()
+
+    def test_combined_identity_and_lexical_retrieval_equivalent(self, tmp_path: Path) -> None:
+        from memory.store import RetrievalQuery
+
+        reference, durable = self._paired_stores(tmp_path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findable text",
+            at=AT, source="s", context=CTX,
+        )
+        for store in (reference, durable):
+            store.persist(obs)
+        ref_candidates = reference.retrieve(
+            RetrievalQuery(context=CTX, identity=obs.id, text="findable"), retrieved_at=AT
+        )
+        dur_candidates = durable.retrieve(
+            RetrievalQuery(context=CTX, identity=obs.id, text="findable"), retrieved_at=AT
+        )
+        assert [c.relevance for c in ref_candidates] == [c.relevance for c in dur_candidates]
+        durable.close()
+
+    def test_custom_retention_kind_error_equivalent(self, tmp_path: Path) -> None:
+        from memory.store import RetrievalQuery
+
+        reference, durable = self._paired_stores(tmp_path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        for store in (reference, durable):
+            store.persist(obs)
+            store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=Kind("t.custom"), at=AT))
+            with pytest.raises(ValueError):
+                store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
+        durable.close()
+
+    # ---- Gaps closed by this task's own audit, beyond the brief's template ----
+
+    def test_explicit_archive_inclusive_retrieval_equivalent(self, tmp_path: Path) -> None:
+        """RR-03: an explicit archive-inclusive query may retrieve an
+        archived item; default queries on both backends still exclude it.
+        """
+        from memory.retention import ARCHIVED
+        from memory.store import RetrievalQuery
+
+        reference, durable = self._paired_stores(tmp_path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        for store in (reference, durable):
+            store.persist(obs)
+            store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+        default_query = RetrievalQuery(context=CTX, text="findme")
+        ref_default = reference.retrieve(default_query, retrieved_at=AT)
+        dur_default = durable.retrieve(default_query, retrieved_at=AT)
+        assert ref_default == () and dur_default == ()
+        inclusive_query = RetrievalQuery(context=CTX, text="findme", include_archived=True)
+        ref_inclusive = reference.retrieve(inclusive_query, retrieved_at=AT)
+        dur_inclusive = durable.retrieve(inclusive_query, retrieved_at=AT)
+        assert [c.item.id for c in ref_inclusive] == [c.item.id for c in dur_inclusive] == [obs.id]
+        durable.close()
+
+    def test_archive_then_reactivate_retrieval_equivalent(self, tmp_path: Path) -> None:
+        """RR-04: ARCHIVED then ACTIVE makes an item eligible again on both
+        backends.
+        """
+        from memory.retention import ARCHIVED
+        from memory.store import RetrievalQuery
+
+        reference, durable = self._paired_stores(tmp_path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        later = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+        for store in (reference, durable):
+            store.persist(obs)
+            store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ARCHIVED, at=AT))
+            store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ACTIVE, at=later))
+        query = RetrievalQuery(context=CTX, text="findme")
+        ref_candidates = reference.retrieve(query, retrieved_at=later)
+        dur_candidates = durable.retrieve(query, retrieved_at=later)
+        ref_ids = [c.item.id for c in ref_candidates]
+        dur_ids = [c.item.id for c in dur_candidates]
+        assert ref_ids == dur_ids == [obs.id]
+        durable.close()
+
+    def test_retention_append_order_beats_timestamp_order_equivalent(self, tmp_path: Path) -> None:
+        """RR-08: RetentionLog.current() is a projection over append order,
+        never sorted by RetentionMark.at -- prove this holds identically on
+        both backends when the marks' timestamps are reversed relative to
+        the order they were persisted in.
+        """
+        from memory.retention import ARCHIVED
+
+        reference, durable = self._paired_stores(tmp_path)
+        target = Id(Kind("t.item"), "x")
+        later = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+        mark_active_later = RetentionMark(item=Ref(id=target), accessibility=ACTIVE, at=later)
+        mark_archived_earlier = RetentionMark(item=Ref(id=target), accessibility=ARCHIVED, at=AT)
+        for store in (reference, durable):
+            store.persist(mark_active_later)  # appended first, later timestamp
+            store.persist(mark_archived_earlier)  # appended second, earlier timestamp
+        assert reference.retention_for(target) == durable.retention_for(target)
+        # The LAST-APPENDED mark (ARCHIVED, despite its earlier timestamp) wins on both.
+        assert reference.retention_for(target)[-1].accessibility == ARCHIVED
+        assert durable.retention_for(target)[-1].accessibility == ARCHIVED
+        durable.close()
+
+    def test_belief_state_from_either_backends_query_results_is_identical(
+        self, tmp_path: Path
+    ) -> None:
+        """BE-05: belief_state() fed claims_for()/conflicts_for() results
+        from either backend produces an identical BeliefProjection.
+        """
+        from memory.belief import belief_state
+
+        reference, durable = self._paired_stores(tmp_path)
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("a"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c2"), subject=SUBJECT, predicate=Kind("t.p"), value=Known("b"),
+            context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        contradiction = Contradiction(
+            id=Id(Kind("t.contra"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=c1.id), Ref(id=c2.id)), detected_at=AT, context=CTX,
+        )
+        for store in (reference, durable):
+            store.persist(c1)
+            store.persist(c2)
+            store.persist(contradiction)
+
+        ref_projection = belief_state(
+            subject=SUBJECT, predicate=Kind("t.p"), query_context=CTX,
+            claims=reference.claims_for(SUBJECT, Kind("t.p")),
+            conflict_entries=reference.conflicts_for(SUBJECT, Kind("t.p")),
+        )
+        dur_projection = belief_state(
+            subject=SUBJECT, predicate=Kind("t.p"), query_context=CTX,
+            claims=durable.claims_for(SUBJECT, Kind("t.p")),
+            conflict_entries=durable.conflicts_for(SUBJECT, Kind("t.p")),
+        )
+        assert ref_projection == dur_projection
+        durable.close()
+
+    def test_admit_on_either_backends_retrieve_output_is_identical(self, tmp_path: Path) -> None:
+        """BE-06/RR-12: admit() given retrieve() output from either backend
+        produces the same WorkingSet/excluded split, and a capacity-excluded
+        candidate remains independently resolvable on the durable backend
+        (excluded is not the same thing as forgotten/archived).
+        """
+        from memory.recall import admit
+        from memory.store import RetrievalQuery
+
+        reference, durable = self._paired_stores(tmp_path)
+        obs1: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme one",
+            at=AT, source="s", context=CTX,
+        )
+        obs2: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="findme two",
+            at=AT, source="s", context=CTX,
+        )
+        for store in (reference, durable):
+            store.persist(obs1)
+            store.persist(obs2)
+        query = RetrievalQuery(context=CTX, text="findme")
+        ref_candidates = reference.retrieve(query, retrieved_at=AT)
+        dur_candidates = durable.retrieve(query, retrieved_at=AT)
+
+        ref_working, ref_excluded = admit(ref_candidates, 1)
+        dur_working, dur_excluded = admit(dur_candidates, 1)
+        assert ref_working.admitted == dur_working.admitted
+        assert ref_excluded == dur_excluded
+        assert len(dur_excluded) == 1
+        assert durable.resolve(dur_excluded[0].item.id) is not None  # excluded != forgotten
+        durable.close()
+
+    def test_unsupported_value_fails_identically_on_both_backends(self, tmp_path: Path) -> None:
+        """BE-08: an unsupported persisted value fails at both the semantic
+        boundary (InMemoryStore, via UnsupportedPersistedValue) and the
+        SQLite boundary (SqliteMemoryStore, which applies to its internal
+        reference FIRST -- so it raises the identical exception, before any
+        journal row is written), never silently diverging.
+        """
+        from memory.codec import UnsupportedPersistedValue
+
+        class NotPersistable:
+            pass
+
+        reference, durable = self._paired_stores(tmp_path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value=NotPersistable(),
+            at=AT, source="s", context=CTX,
+        )
+        for store in (reference, durable):
+            with pytest.raises(UnsupportedPersistedValue):
+                store.persist(obs)
+        assert reference.resolve(obs.id) is None
+        assert durable.resolve(obs.id) is None
+        durable_path = tmp_path / "equivalence.sqlite"
+        durable.close()
+
+        conn = sqlite3.connect(str(durable_path))
+        count = conn.execute("SELECT COUNT(*) FROM memory_ops").fetchone()[0]
+        conn.close()
+        assert count == 0  # the rejected persist() never reached the journal
+
+
+class TestEpisodeSqliteTransitions:
+    """Dedicated live-SqliteMemoryStore proofs for Episode matrix cases not
+    already exercised by TestJournalReplay (replay-time corruption), the
+    lifecycle tests in TestTransactionalPersist, or TestBackendEquivalence's
+    test_episode_lifecycle_equivalent (single-item create/append/close).
+    """
+
+    def test_es01_create_only_leaves_empty_header_no_items_no_close(self, tmp_path: Path) -> None:
+        from memory.episode import Episode
+
+        path = tmp_path / "es01.sqlite"
+        store = SqliteMemoryStore(path)
+        episode_id = Id(Kind("t.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        resolved = store.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == ()
+        assert resolved.closed_at is None
+        store.close()
+
+    def test_es03_duplicate_ref_gets_new_position_and_survives_reopen(self, tmp_path: Path) -> None:
+        from memory.episode import Episode
+
+        path = tmp_path / "es03.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        ref_a = Ref(id=Id(Kind("t.item"), "a"))
+        ref_b = Ref(id=Id(Kind("t.item"), "b"))
+        store = SqliteMemoryStore(path)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.append_episode(episode_id, ref_a)
+        store.append_episode(episode_id, ref_b)
+        store.append_episode(episode_id, ref_a)  # duplicate Ref -- new position, not deduplicated
+        store.close()
+
+        reopened = SqliteMemoryStore(path)
+        resolved = reopened.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (ref_a, ref_b, ref_a)
+        reopened.close()
+
+    def test_es04_append_call_order_survives_reversed_member_timestamps(
+        self, tmp_path: Path
+    ) -> None:
+        """ES-04: append_episode() takes no timestamp of its own -- the only
+        way "member timestamps" could reorder stored append order is if the
+        durable layer keyed off the referenced items' own `at` fields. Prove
+        appending a later-timestamped item before an earlier-timestamped one
+        preserves pure call order, including after reopen.
+        """
+        from memory.episode import Episode
+
+        path = tmp_path / "es04.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        newer_item = Ref(id=Id(Kind("t.item"), "newer"))
+        older_item = Ref(id=Id(Kind("t.item"), "older"))
+        earlier = AT
+        later = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+        store = SqliteMemoryStore(path)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.persist(Observation(
+            id=older_item.id, subject=SUBJECT, value="old", at=earlier, source="s", context=CTX,
+        ))
+        store.persist(Observation(
+            id=newer_item.id, subject=SUBJECT, value="new", at=later, source="s", context=CTX,
+        ))
+        store.append_episode(episode_id, newer_item)  # appended first (later `at`)
+        store.append_episode(episode_id, older_item)  # appended second (earlier `at`)
+        store.close()
+
+        reopened = SqliteMemoryStore(path)
+        resolved = reopened.resolve(episode_id)
+        assert isinstance(resolved, Episode)
+        assert resolved.items() == (newer_item, older_item)  # call order, not timestamp order
+        reopened.close()
+
+    def test_es06_live_append_after_close_rejected_with_no_journal_row(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "es06.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        store = SqliteMemoryStore(path)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.close_episode(episode_id, AT)
+        with pytest.raises(ValueError):
+            store.append_episode(episode_id, Ref(id=Id(Kind("t.item"), "x")))
+        store.close()
+
+        # rejected append wrote nothing
+        assert _journal_op_kinds(path) == ["create_episode", "close_episode"]
+
+    def test_es07_live_double_close_rejected_with_no_journal_row(self, tmp_path: Path) -> None:
+        path = tmp_path / "es07.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        store = SqliteMemoryStore(path)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+        store.close_episode(episode_id, AT)
+        with pytest.raises(ValueError):
+            store.close_episode(episode_id, AT)
+        store.close()
+
+        # second close wrote nothing
+        assert _journal_op_kinds(path) == ["create_episode", "close_episode"]
+
+    def test_es08_live_close_before_opened_at_rejected_with_no_journal_row(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "es08.sqlite"
+        episode_id = Id(Kind("t.episode"), "ep1")
+        opened_at = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+        too_early = AT  # 2024-01-01, before opened_at
+        store = SqliteMemoryStore(path)
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=opened_at)
+        with pytest.raises(ValueError):
+            store.close_episode(episode_id, too_early)
+        store.close()
+
+        assert _journal_op_kinds(path) == ["create_episode"]  # rejected close wrote nothing
+
+
+class TestEpisodeSnapshotIsNotAMutationMechanism:
+    def test_persist_does_not_accept_an_episode(self, tmp_path: Path) -> None:
+        from memory.episode import Episode
+        from memory.store import UnsupportedMemoryRecord
+
+        store = SqliteMemoryStore(tmp_path / "es12.sqlite")
+        episode = Episode(
+            id=Id(Kind("t.episode"), "ep1"), subject=SUBJECT, context=CTX, opened_at=AT
+        )
+        with pytest.raises(UnsupportedMemoryRecord):
+            store.persist(episode)  # type: ignore[arg-type]
+        store.close()
+
+
+class TestConstructorResourceCleanup:
+    def test_replay_failure_closes_connection_before_raising(self, tmp_path: Path) -> None:
+        """Every OTHER constructor failure path (_initialize_new_database,
+        _validate_existing_schema, the FTS-rebuild-after-replay step, the
+        partial-schema branch) explicitly closes self._conn before
+        re-raising. _replay_journal()'s own raise sites never close
+        anything, so the call site must -- otherwise a corrupted database
+        leaves a dangling open connection/file handle behind a constructor
+        call that never returned an object the caller could call close()
+        on. Confirmed by direct reproduction that this actually holds an OS
+        file lock (PermissionError removing the file right after, no gc
+        needed) before the fix in this task.
+        """
+        path = tmp_path / "leak-check.sqlite"
+        conn = _fresh_v1_schema(path)
+        _insert_op_row(conn, 1, "teleport", b"whatever")  # unknown op kind -> StoreCorruption
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption) as excinfo:
+            SqliteMemoryStore(path)
+
+        # Dig the partially-constructed `self` out of the traceback -- the
+        # constructor never returned an instance we could hold a name to,
+        # but the traceback frame for __init__ still has `self` in its
+        # locals, which is exactly how this leak is reachable/observable at
+        # all outside the process (and exactly why it mattered).
+        tb = excinfo.tb
+        init_frame = None
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == "__init__":
+                init_frame = tb.tb_frame
+                break
+            tb = tb.tb_next
+        assert init_frame is not None, "expected the raise to unwind through __init__"
+        leaked_self = init_frame.f_locals["self"]
+        with pytest.raises(sqlite3.ProgrammingError):
+            leaked_self._conn.execute("SELECT 1")  # closed connections refuse further use
+
+
+class TestDatabaseIntegrity:
+    def test_db02_interrupted_episode_append_leaves_no_partial_append(self, tmp_path: Path) -> None:
+        path = tmp_path / "db02.sqlite"
+        store = SqliteMemoryStore(path)
+        episode_id = Id(Kind("t.episode"), "ep1")
+        store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+
+        item = Ref(id=Id(Kind("t.item"), "x"))
+        with _BlockNewOps(store):
+            with pytest.raises(sqlite3.IntegrityError):
+                store.append_episode(episode_id, item)
+
+            from memory.episode import Episode
+            resolved = store.resolve(episode_id)
+            assert isinstance(resolved, Episode)
+            assert resolved.items() == ()
+        store.close()
+
+    def test_db04_retention_mark_and_derived_index_atomic(self, tmp_path: Path) -> None:
+        path = tmp_path / "db04.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+
+        with _BlockNewOps(store):
+            with pytest.raises(sqlite3.IntegrityError):
+                store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ACTIVE, at=AT))
+            assert store.retention_for(obs.id) == ()
+        store.close()
+
+    def test_db08_two_readers_of_committed_data_agree(self, tmp_path: Path) -> None:
+        path = tmp_path / "db08.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+        store.persist(obs)
+        store.close()
+
+        reader1 = SqliteMemoryStore(path)
+        reader2 = SqliteMemoryStore(path)
+        assert reader1.resolve(obs.id) == reader2.resolve(obs.id)
+        reader1.close()
+        reader2.close()
+
+    def test_db09_second_writer_on_locked_database_fails_explicitly(self, tmp_path: Path) -> None:
+        # VERIFIED before this plan was written: the failure happens inside
+        # the SECOND store's CONSTRUCTOR, not a later persist() call -- the
+        # constructor's own FTS-rebuild-after-replay step (Task 6) needs
+        # BEGIN IMMEDIATE too, and that's what collides with store1's held
+        # lock. store2 never finishes constructing, so there is no store2
+        # object afterward -- direct reproduction confirmed this exact
+        # sequence, see the "DB-09 implication" note in Task 4. This task's
+        # own audit additionally confirmed (see test_db09_failure_is_the_
+        # constructors_fts_rebuild_step_not_initialize_new_database below)
+        # that this specifically exercises the FTS-rebuild except-branch,
+        # not the _initialize_new_database except-branch -- store1 already
+        # completed initialization before store2 is ever constructed, so
+        # store2 necessarily takes the "existing schema" branch.
+        path = tmp_path / "db09.sqlite"
+        store1 = SqliteMemoryStore(path)
+        store1._conn.execute("BEGIN IMMEDIATE")  # pyright: ignore[reportPrivateUsage]
+        store1._conn.execute(  # pyright: ignore[reportPrivateUsage]
+            "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (1, 'persist', ?, ?)",
+            (b"x", b"y"),
+        )
+
+        with pytest.raises(sqlite3.OperationalError):
+            SqliteMemoryStore(path)  # lock contention -- explicit failure, no silent retry/wait
+
+        store1._conn.execute("ROLLBACK")  # pyright: ignore[reportPrivateUsage]
+        store1.close()
+
+        # After store1 releases the lock, a fresh construction succeeds cleanly.
+        store3 = SqliteMemoryStore(path)
+        store3.close()
+
+    def test_db09_failure_is_the_constructors_fts_rebuild_step_not_initialize_new_database(
+        self, tmp_path: Path
+    ) -> None:
+        """This task's brief flagged DB-09 as the one test in this suite
+        specifically responsible for exercising Task 6's FTS-rebuild-after-
+        replay rollback/close/re-raise branch, which had no test covering
+        it as of Task 6's own commit. Reasoning alone (store1 already holds
+        a committed, schema-complete database before store2 is constructed,
+        so store2 must take the "existing schema" branch, never
+        "_initialize_new_database") is confirmed here empirically by
+        walking the traceback of the raised OperationalError and asserting
+        the failing frame is literally inside SqliteMemoryStore.__init__
+        while the object's _reference is already a *replayed* InMemoryStore
+        (proving journal replay already completed) and NOT inside
+        _initialize_new_database (which never sets self._reference from
+        _replay_journal -- it sets it directly to a fresh empty InMemoryStore
+        with no _known_entity_ids populated from replay).
+        """
+        path = tmp_path / "db09-branch-check.sqlite"
+        store1 = SqliteMemoryStore(path)
+        # Give store1 committed durable state so replay on the second store
+        # is nontrivial (proves replay ran, not just "0 rows, trivially ok").
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findme",
+            at=AT, source="s", context=CTX,
+        )
+        store1.persist(obs)
+        store1._conn.execute("BEGIN IMMEDIATE")  # pyright: ignore[reportPrivateUsage]
+        store1._conn.execute(  # pyright: ignore[reportPrivateUsage]
+            "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (99, 'persist', ?, ?)",
+            (b"x", b"y"),
+        )
+
+        with pytest.raises(sqlite3.OperationalError) as excinfo:
+            SqliteMemoryStore(path)
+
+        tb = excinfo.tb
+        init_frame = None
+        while tb is not None:
+            if tb.tb_frame.f_code.co_name == "__init__":
+                init_frame = tb.tb_frame
+            tb = tb.tb_next
+        assert init_frame is not None, "expected OperationalError to unwind through __init__"
+        failed_self = init_frame.f_locals["self"]
+        # If this failure had instead come from _initialize_new_database
+        # (the OTHER call site that issues BEGIN IMMEDIATE), self._reference
+        # would never have been set at all by the time the exception fires,
+        # because _initialize_new_database's own BEGIN IMMEDIATE happens
+        # BEFORE self._reference is assigned in that branch. Here, self
+        # already carries a fully-replayed reference containing store1's
+        # committed Observation -- proof this is the FTS-rebuild branch,
+        # reached only after a successful _replay_journal().
+        assert hasattr(failed_self, "_reference"), (
+            "self._reference must already be set -- proves replay completed "
+            "and this is the FTS-rebuild branch, not _initialize_new_database"
+        )
+        assert failed_self._reference.resolve(obs.id) == obs
+
+        store1._conn.execute("ROLLBACK")  # pyright: ignore[reportPrivateUsage]
+        store1.close()
+
+    def test_db10_sql_injection_like_text_cannot_mutate_database(self, tmp_path: Path) -> None:
+        path = tmp_path / "db10.sqlite"
+        store = SqliteMemoryStore(path)
+        malicious: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT,
+            value="'; DROP TABLE memory_ops; --", at=AT, source="s", context=CTX,
+        )
+        store.persist(malicious)
+        from memory.store import RetrievalQuery
+        candidates = store.retrieve(
+            RetrievalQuery(context=CTX, text="'; DROP TABLE memory_ops; --"), retrieved_at=AT
+        )
+        assert len(candidates) == 1
+        store.close()
+
+        conn = sqlite3.connect(str(path))
+        count = conn.execute("SELECT COUNT(*) FROM memory_ops").fetchone()[0]
+        conn.close()
+        assert count == 1  # table intact, row survived
 
 
 def test_fts5_is_available_in_this_environment() -> None:
