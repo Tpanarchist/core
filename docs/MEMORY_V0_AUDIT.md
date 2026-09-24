@@ -4,7 +4,7 @@ Mirrors Core's own `docs/V0_AUDIT.md` at the Memory layer. See
 `docs/memory-passes/04-architectural-closure.md` for what this pass
 covers and why.
 
-As of this audit: **462 tests** under `tests/memory/` (architecture +
+As of this audit: **463 tests** under `tests/memory/` (architecture +
 semantics + integration), `ruff check src/memory tests/memory` clean,
 `pyright src/memory tests/memory` (strict) clean. Every "Test evidence"
 citation below was independently confirmed against the real repository
@@ -140,17 +140,19 @@ than transcribed from the pass's draft.
 | IM-03 | `belief` imports `sqlite3` (or `sqlite_store`) | Fails | `test_every_import_edge_is_allowed` (`belief`'s `ALLOWED_IMPORTS` entry has no `sqlite_store`/stdlib-`sqlite3` edge) plus the explicit negative seam `TestCriticalNegativeSeams::test_negative_seam[belief-memory.sqlite_store]` |
 | IM-04 | `recall` imports `store` | Fails | `TestCriticalNegativeSeams::test_negative_seam[recall-memory.store]` |
 | IM-05 | `codec` imports `sqlite3` | Fails | `test_every_import_edge_is_allowed` (`codec`'s `ALLOWED_IMPORTS` entry — `{core.value, core.identity, core.time, core.context}` — has no stdlib/sqlite entry at all) |
-| IM-06 | `store` imports `sqlite_store` (the inversion — tier 1 depending on tier 2) | Fails | **No dedicated negative-seam case exists for this exact edge.** `TestCriticalNegativeSeams`'s 14 parametrized cases cover `sqlite_store`'s own forbidden imports and each tier-0 module's forbidden imports of `store`/`sqlite_store`, but none names `store → memory.sqlite_store` specifically. The only coverage is indirect: `store`'s `ALLOWED_IMPORTS` entry does not include `memory.sqlite_store`, so `test_every_import_edge_is_allowed` would fail if `store.py` ever imported it — confirmed by reading both the entry and `store.py`'s actual imports. This is a real, honestly-recorded gap: a genuine dedicated regression case for this specific inversion is missing, not merely under-cited. |
+| IM-06 | `store` imports `sqlite_store` (the inversion — tier 1 depending on tier 2) | Fails | `TestCriticalNegativeSeams::test_negative_seam[store-memory.sqlite_store]` (added by this fix wave, closing a gap this same audit found: no dedicated case previously existed for this exact edge), plus the same indirect coverage as before — `store`'s `ALLOWED_IMPORTS` entry does not include `memory.sqlite_store`, so `test_every_import_edge_is_allowed` would also fail if `store.py` ever imported it |
 | IM-07 | `sqlite_store` imports only what `MEMORY_ARCHITECTURE.md`'s row for it explicitly lists | Pass | `test_every_import_edge_is_allowed` (`sqlite_store`'s row in `ALLOWED_IMPORTS`) |
 | IM-08 | A module exists under `src/memory/` with no entry in the allowed-imports map | Module-inventory test fails | `TestModuleInventory::test_discovered_modules_exactly_match_the_architecture_map` |
 | IM-09 | Import-time SQLite connection/file creation | Side-effect test fails | `tests/memory/architecture/test_import_side_effects.py::test_importing_module_has_no_side_effects` (all 8 parametrized modules: `memory`, `memory.belief`, `memory.codec`, `memory.episode`, `memory.recall`, `memory.retention`, `memory.sqlite_store`, `memory.store`) |
 | IM-10 | Module import reads clock/UUID/random | Side-effect test fails | Same as IM-09 — one harness (`tests/architecture/_side_effect_harness.py`, Core's own generic script, reused unmodified) guards both nondeterminism sources and filesystem/connection side effects in the same fresh-process run |
 
-All 3 non-parametrized node ids above and all 22 parametrized cases
-(14 negative-seam + 8 side-effect) were run directly and pass. IM-06 is
-the one case in this section without a dedicated test — noted above
-rather than papered over with a citation that doesn't actually name a
-test of that scenario.
+All 3 non-parametrized node ids above and all 23 parametrized cases
+(15 negative-seam + 8 side-effect) were run directly and pass. IM-06
+originally had no dedicated negative-seam case — noted honestly rather
+than papered over with a citation that didn't actually name a test of
+that scenario — and was closed by this same fix wave by adding
+`("store", "memory.sqlite_store")` to
+`TestCriticalNegativeSeams`'s parametrize list.
 
 ---
 
@@ -268,17 +270,18 @@ verbatim, the same five constructions with the same "Built from" shapes
 
 ## Closure summary
 
-- **462/462** tests pass under `tests/memory/` (`uv run pytest
+- **463/463** tests pass under `tests/memory/` (`uv run pytest
   tests/memory/ -q`).
 - `ruff check src/memory tests/memory` — all checks passed.
 - `pyright src/memory tests/memory` — 0 errors, 0 warnings, 0
   informations.
-- **824/824** tests pass under the full scoped repository gate
+- **825/825** tests pass under the full scoped repository gate
   (`uv run pytest --ignore=tests/personal_finance -q`); `ruff check
   src/core src/memory tests/architecture tests/memory` and `pyright
   src/core src/memory tests/architecture tests/memory` are both clean
   (0 errors, 0 warnings, 0 informations) — re-run and confirmed as part
-  of this fix wave.
+  of this fix wave, including the IM-06 regression case added to close
+  the last remaining gap in matrix section T.
 - Every citation in Tables A and B, the Ref-closure audit, the
   information-preservation audit, the cross-module scenarios table, and
   the import/dependency audit was independently re-verified against the
@@ -300,13 +303,13 @@ format at the Core layer.
 
 ```text
 [x] All Passes 1-3 tests still pass (778 at the start of this pass),
-    plus Pass 4's own additions. (462 passed under tests/memory/;
-    824 passed under the full scoped repository gate)
+    plus Pass 4's own additions. (463 passed under tests/memory/;
+    825 passed under the full scoped repository gate)
 [x] Import graph exactly obeys MEMORY_ARCHITECTURE.md's dependency table
     (both memory.* and core.* edges); actual memory.*-only subgraph is
-    acyclic; every IM-01..08 negative/inventory seam holds, except
-    IM-06 which has no dedicated negative-seam test (see "Import/
-    dependency audit" above -- an honestly-recorded gap, not a failure).
+    acyclic; every IM-01..08 negative/inventory seam holds, including
+    IM-06 (store -> memory.sqlite_store), closed by this fix wave's
+    added TestCriticalNegativeSeams::test_negative_seam[store-memory.sqlite_store].
     (test_import_graph.py::TestImportEdgesAreAllowed,
     TestGraphAcyclicity, TestCriticalNegativeSeams, TestModuleInventory,
     TestCoreNeverImportsMemory -- all passing)

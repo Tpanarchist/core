@@ -277,6 +277,7 @@ class TestCriticalNegativeSeams:
             ("belief", "memory.sqlite_store"),
             ("codec", "memory.store"),
             ("codec", "memory.sqlite_store"),
+            ("store", "memory.sqlite_store"),
         ],
     )
     def test_negative_seam(self, module: str, forbidden: str) -> None:
