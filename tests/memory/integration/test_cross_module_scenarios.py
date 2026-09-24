@@ -46,20 +46,25 @@ class TestX03RetrievalIsNotBelief:
         )
         true_claim: Claim[object] = Claim(
             id=Id(Kind("t.claim"), "true1"), subject=SUBJECT, predicate=PREDICATE,
-            value=Known("correct"), context=CTX, asserted_by=AGENT,
+            value=Known("findme correct"), context=CTX, asserted_by=AGENT,
             evidence_refs=(), at=AT,
         )
         store.persist(false_claim)
         store.persist(true_claim)
 
+        # Both claims are genuine lexical matches (both contain "findme") --
+        # this is what actually gives WorkingSet(capacity=1) something to
+        # exclude. The false claim was persisted first and ranks first.
         candidates = store.retrieve(RetrievalQuery(context=CTX, text="findme"), retrieved_at=AT)
-        assert len(candidates) >= 1
+        assert len(candidates) == 2
         assert candidates[0].item == Ref(id=false_claim.id)
+        assert candidates[1].item == Ref(id=true_claim.id)
 
-        # attention ≠ truth: WorkingSet(capacity=1) may therefore contain
-        # only the false claim.
-        working_set, _excluded = admit(candidates, capacity=1)
+        # attention ≠ truth: WorkingSet(capacity=1) admits only the false
+        # claim and genuinely excludes the true one.
+        working_set, excluded = admit(candidates, capacity=1)
         assert working_set.admitted == (candidates[0],)
+        assert excluded == (candidates[1],)
 
         # This must NOT alter persisted belief/conflict state -- belief_state
         # is computed from claims_for(), never from what retrieval/attention
