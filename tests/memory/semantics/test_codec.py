@@ -97,6 +97,21 @@ class TestRejections:
             as_persisted_value({"items": [1, 2]})
         assert exc_info.value.path == ("items",)
 
+    def test_ip_06_offending_value_itself_is_retained_not_just_its_path(self) -> None:
+        # MEMORY_ADVERSARIAL_MATRIX.md IP-06: path + offending type/value
+        # information must be retained in the error safely -- test_cd_11/
+        # test_cd_12/test_cd_13 above all check .path precisely but none
+        # checks .value is the actual offending object, not a copy, repr,
+        # or string fallback.
+        class Exotic:
+            pass
+
+        offender = Exotic()
+        with pytest.raises(UnsupportedPersistedValue) as exc_info:
+            as_persisted_value({"a": offender})
+        assert exc_info.value.value is offender
+        assert exc_info.value.path == ("a",)
+
     def test_cd_12_unsupported_object_three_levels_deep_reports_exact_path(self) -> None:
         class Exotic:
             pass
