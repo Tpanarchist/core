@@ -26,7 +26,11 @@ import sys
 import pytest
 
 _SRC = pathlib.Path(__file__).resolve().parent.parent.parent.parent / "src" / "memory"
-_HARNESS = pathlib.Path(__file__).resolve().parent.parent.parent / "architecture" / "_side_effect_harness.py"  # noqa: E501
+_HARNESS = (
+    pathlib.Path(__file__).resolve().parent.parent.parent
+    / "architecture"
+    / "_side_effect_harness.py"
+)
 
 
 def _discover_module_dotted_paths() -> list[str]:
