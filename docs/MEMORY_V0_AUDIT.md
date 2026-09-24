@@ -137,14 +137,14 @@ than transcribed from the pass's draft.
 |---|---|---|---|
 | IM-01 | A tier-0 Memory module imports a `memory.*` sibling it doesn't need | Fails | `test_import_graph.py::TestImportEdgesAreAllowed::test_every_import_edge_is_allowed` |
 | IM-02 | Any `core.*` module imports `memory.*` | Fails | `test_import_graph.py::TestCoreNeverImportsMemory::test_no_core_module_imports_memory` |
-| IM-03 | `belief` imports `sqlite3` (or `sqlite_store`) | Fails | `test_every_import_edge_is_allowed` (`belief`'s `ALLOWED_IMPORTS` entry has no `sqlite_store`/stdlib-`sqlite3` edge) plus the explicit negative seam `TestCriticalNegativeSeams::test_negative_seam[belief-memory.sqlite_store]` |
+| IM-03 | `belief` imports `sqlite3` (or `sqlite_store`) | Fails | The `memory.sqlite_store` half is genuinely, mechanically covered: `TestCriticalNegativeSeams::test_negative_seam[belief-memory.sqlite_store]` (`_dependency_edges()` tracks `memory.*`-prefixed targets correctly). The stdlib-`sqlite3` half is **not** mechanically covered — see IM-05's honest wording, which applies identically here (`_dependency_edges()`'s `_add_target()` only records targets starting with `core.`/`memory.`, so a bare `import sqlite3` in `belief.py` would produce no edge and would not be caught by `test_every_import_edge_is_allowed`; confirmed by direct reproduction). Held structurally by code review (`belief.py`'s actual imports contain no stdlib beyond what `MEMORY_ARCHITECTURE.md` lists), not mechanically enforced for that half. |
 | IM-04 | `recall` imports `store` | Fails | `TestCriticalNegativeSeams::test_negative_seam[recall-memory.store]` |
-| IM-05 | `codec` imports `sqlite3` | Fails | `test_every_import_edge_is_allowed` (`codec`'s `ALLOWED_IMPORTS` entry — `{core.value, core.identity, core.time, core.context}` — has no stdlib/sqlite entry at all) |
+| IM-05 | `codec` imports `sqlite3` | Fails | No dedicated test. `_dependency_edges()`'s `_add_target()` only records targets starting with `core.`/`memory.`, so a bare `import sqlite3` in `codec.py` produces no edge at all — `edges - ALLOWED_IMPORTS["codec"]` would stay empty and `test_every_import_edge_is_allowed` would **not** fail, confirmed by direct reproduction (reading `_add_target()`'s filter and tracing a synthetic `import sqlite3` through it). Held structurally by code review (`codec.py`'s actual imports — `base64`, `json`, `math`, `collections.abc.Mapping`, `datetime.datetime`, `types.MappingProxyType`, `typing.cast`, plus the four `core.*` modules `MEMORY_ARCHITECTURE.md` lists — contain no stdlib `sqlite3` today), not mechanically enforced. |
 | IM-06 | `store` imports `sqlite_store` (the inversion — tier 1 depending on tier 2) | Fails | `TestCriticalNegativeSeams::test_negative_seam[store-memory.sqlite_store]` (added by this fix wave, closing a gap this same audit found: no dedicated case previously existed for this exact edge), plus the same indirect coverage as before — `store`'s `ALLOWED_IMPORTS` entry does not include `memory.sqlite_store`, so `test_every_import_edge_is_allowed` would also fail if `store.py` ever imported it |
 | IM-07 | `sqlite_store` imports only what `MEMORY_ARCHITECTURE.md`'s row for it explicitly lists | Pass | `test_every_import_edge_is_allowed` (`sqlite_store`'s row in `ALLOWED_IMPORTS`) |
 | IM-08 | A module exists under `src/memory/` with no entry in the allowed-imports map | Module-inventory test fails | `TestModuleInventory::test_discovered_modules_exactly_match_the_architecture_map` |
-| IM-09 | Import-time SQLite connection/file creation | Side-effect test fails | `tests/memory/architecture/test_import_side_effects.py::test_importing_module_has_no_side_effects` (all 8 parametrized modules: `memory`, `memory.belief`, `memory.codec`, `memory.episode`, `memory.recall`, `memory.retention`, `memory.sqlite_store`, `memory.store`) |
-| IM-10 | Module import reads clock/UUID/random | Side-effect test fails | Same as IM-09 — one harness (`tests/architecture/_side_effect_harness.py`, Core's own generic script, reused unmodified) guards both nondeterminism sources and filesystem/connection side effects in the same fresh-process run |
+| IM-09 | Import-time SQLite connection/file creation | Side-effect test fails | **Not actually covered — confirmed by direct reproduction.** `tests/architecture/_side_effect_harness.py::_install_guards()`'s `_audit_hook` catches write-mode `open()`, `os.mkdir`/`rmdir`/`rename`/`replace`/`remove`/`unlink`, `subprocess.Popen`, and socket creation — but its `_rejected_events` set has no `sqlite3.connect`/`sqlite3.connect/handle` entry. A synthetic import-time `sqlite3.connect(...)` call, run through the harness directly, exits 0 and creates the file: the harness does not detect it. `sqlite_store.py`'s only `sqlite3.connect` call is inside `SqliteMemoryStore.__init__`, not at module level, so this doesn't affect Memory's actual code today — but the test evidence for this specific sub-case is honestly absent, not proven, and `tests/memory/architecture/test_import_side_effects.py::test_importing_module_has_no_side_effects` passing for `memory.sqlite_store` does **not** demonstrate this particular guard works (it demonstrates `sqlite_store.py`'s current top level makes no such call, which is a weaker claim). Not modifying the harness itself to add this event — it lives in Core's own frozen test tree, out of scope for this pass. |
+| IM-10 | Module import reads clock/UUID/random | Side-effect test fails | Genuinely, fully covered — distinct from IM-09. The same harness's guards on `uuid.uuid1`/`uuid.uuid4`, `time.time`/`time.time_ns`/`time.monotonic`/`time.monotonic_ns`/`time.perf_counter`/`time.perf_counter_ns`, `random.random`/`randrange`/`randint`/`choice`/`choices`/`getrandbits`, `os.urandom`, and `datetime.datetime.now`/`.utcnow` are all real, mechanical `AttributeError`/raise-on-call substitutions (not audit-hook-based, so no event-list gap applies) — confirmed by reading `_install_guards()` directly. `tests/memory/architecture/test_import_side_effects.py::test_importing_module_has_no_side_effects` (all 8 parametrized modules, all passing) is genuine, complete evidence for this case. |
 
 All 3 non-parametrized node ids above and all 23 parametrized cases
 (15 negative-seam + 8 side-effect) were run directly and pass. IM-06
@@ -152,7 +152,15 @@ originally had no dedicated negative-seam case — noted honestly rather
 than papered over with a citation that didn't actually name a test of
 that scenario — and was closed by this same fix wave by adding
 `("store", "memory.sqlite_store")` to
-`TestCriticalNegativeSeams`'s parametrize list.
+`TestCriticalNegativeSeams`'s parametrize list. IM-03's and IM-05's
+stdlib-`sqlite3` claims, and IM-09's SQLite-connection claim, were
+found by a later re-review to overclaim mechanical coverage the actual
+test code does not provide — both `_dependency_edges()` (tracks only
+`core.*`/`memory.*` targets) and `_side_effect_harness.py`'s audit hook
+(no `sqlite3.connect` event in its rejected-events set) were read
+directly and a synthetic reproduction run for the latter, and the
+wording above now states plainly what is and isn't mechanically
+proven rather than what was hoped to be true.
 
 ---
 
@@ -307,15 +315,25 @@ format at the Core layer.
     825 passed under the full scoped repository gate)
 [x] Import graph exactly obeys MEMORY_ARCHITECTURE.md's dependency table
     (both memory.* and core.* edges); actual memory.*-only subgraph is
-    acyclic; every IM-01..08 negative/inventory seam holds, including
-    IM-06 (store -> memory.sqlite_store), closed by this fix wave's
-    added TestCriticalNegativeSeams::test_negative_seam[store-memory.sqlite_store].
+    acyclic; every IM-01..08 negative/inventory seam holds in the actual
+    code today, including IM-06 (store -> memory.sqlite_store), closed
+    by this fix wave's added
+    TestCriticalNegativeSeams::test_negative_seam[store-memory.sqlite_store].
+    Note: IM-03's and IM-05's stdlib-sqlite3 halves are true in the
+    current code (confirmed by reading belief.py's/codec.py's actual
+    imports) but not mechanically enforced by any test -- see the
+    "Import/dependency audit" table above for the honest limit.
     (test_import_graph.py::TestImportEdgesAreAllowed,
     TestGraphAcyclicity, TestCriticalNegativeSeams, TestModuleInventory,
     TestCoreNeverImportsMemory -- all passing)
 [x] Every Memory module passes fresh-process import-side-effect
-    verification (IM-09, IM-10), reusing
-    tests/architecture/_side_effect_harness.py.
+    verification for IM-10 (clock/UUID/random) in full, reusing
+    tests/architecture/_side_effect_harness.py; IM-09's SQLite-
+    connection sub-case is honestly not covered by this harness (see
+    the "Import/dependency audit" table above) -- true in the current
+    code (sqlite_store.py's only sqlite3.connect call is inside
+    SqliteMemoryStore.__init__, not at module level) but not
+    mechanically proven by this test.
     (tests/memory/architecture/test_import_side_effects.py, 8 modules,
     all passing)
 [x] Ruff clean; Pyright strict clean -- core + memory + their tests +
@@ -346,8 +364,10 @@ format at the Core layer.
 [x] Frozen documents (MEMORY_ARCHITECTURE.md's dependency table
     specifically) agree factually with the finished implementation.
     (Frozen-document consistency audit above)
-[x] Working tree clean after the checkpoint commit. (confirmed via
-    `git status` after this fix wave's closing commit)
+[x] Working tree clean after the checkpoint commit -- no Core- or
+    Memory-scoped changes outstanding (the unrelated, in-progress
+    personal_finance work excluded throughout this document remains in
+    the tree).
 ```
 
 When every box is satisfied, Memory v0 is closed. No further
