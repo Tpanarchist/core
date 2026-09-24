@@ -157,7 +157,7 @@ a dedicated one:
   "supported" — *where*, file and mechanism) → test evidence → status,
   cross-referenced against the adversarial-evidence citations
   `MEMORY_LAWS.md`'s own "Notes on the harder-to-enforce laws" section
-  already provides for the ten hardest laws — confirm each citation still
+  already provides for 13 of the 16 laws — confirm each citation still
   names real, passing tests, not just that it once did.
 - **Ref-closure audit (matrix section V, `RF-01`–`RF-08`)** — for every
   Memory construction, confirm the correct side of "is it `Entity`-bearing
@@ -215,30 +215,33 @@ note — it is not part of closure.
 ## 6. Closure checklist
 
 ```text
-[ ] All Passes 1-3 tests still pass (778 at the start of this pass).
-[ ] Import graph exactly obeys MEMORY_ARCHITECTURE.md's dependency table
+[x] All Passes 1-3 tests still pass (778 at the start of this pass).
+[x] Import graph exactly obeys MEMORY_ARCHITECTURE.md's dependency table
     (both memory.* and core.* edges); actual memory.*-only subgraph is
     acyclic; every IM-01..08 negative/inventory seam holds.
-[ ] Every Memory module passes fresh-process import-side-effect
+[x] Every Memory module passes fresh-process import-side-effect
     verification (IM-09, IM-10), reusing tests/architecture/_side_effect_harness.py.
-[ ] Ruff clean; Pyright strict clean — core + memory + their tests +
+[x] Ruff clean; Pyright strict clean — core + memory + their tests +
     tests/architecture (tests/personal_finance excluded, unrelated).
-[ ] All five derived constructions + PersistedValue/MemoryStore (+
+[x] All five derived constructions + PersistedValue/MemoryStore (+
     InMemoryStore/SqliteMemoryStore as their v0 implementers) audited to a
     code/test home.
-[ ] All 16 Memory laws have concrete code enforcement + test evidence.
-[ ] Every Ref-targetable Memory construction is Entity-bearing (Episode);
+[x] All 16 Memory laws have concrete code enforcement + test evidence.
+[x] Every Ref-targetable Memory construction is Entity-bearing (Episode);
     every non-Ref-targetable one confirmed not constructible as a Ref
     target, including SQLite's own storage-local sequence key (RF-01..08).
-[ ] Core's information-preservation principle holds at the Memory layer
+[x] Core's information-preservation principle holds at the Memory layer
     for all ten IP-01..10 cases, with test evidence.
-[ ] All ten X-01..10 cross-module scenarios have test evidence, existing
+[x] All ten X-01..10 cross-module scenarios have test evidence, existing
     or newly written.
-[ ] memory.__init__ remains intentionally small; py.typed present.
-[ ] Frozen documents (MEMORY_ARCHITECTURE.md's dependency table
+[x] memory.__init__ remains intentionally small; py.typed present.
+[x] Frozen documents (MEMORY_ARCHITECTURE.md's dependency table
     specifically) agree factually with the finished implementation.
-[ ] Working tree clean after the checkpoint commit.
+[x] Working tree clean after the checkpoint commit.
 ```
+
+See `docs/MEMORY_V0_AUDIT.md`'s own "Closure checklist" section for the
+evidence annotation behind each box above.
 
 When every box is satisfied, Memory v0 is closed. No further implementation
 pass follows; subsequent work (a fifth pass, or an application layer like
