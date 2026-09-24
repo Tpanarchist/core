@@ -146,6 +146,45 @@ class TestExistingDatabaseDetection:
         with pytest.raises(StoreCorruption):
             SqliteMemoryStore(path)
 
+    def test_memory_ops_missing_required_columns_is_corruption(self, tmp_path: Path) -> None:
+        # All three required tables present (so this reaches column-shape
+        # validation, not the earlier "which tables exist" check), but
+        # memory_ops is missing payload/digest -- required by prereg §76 to
+        # fail as StoreCorruption rather than a raw, unwrapped
+        # sqlite3.OperationalError the first time replay tries to SELECT them.
+        path = tmp_path / "wrongcols-ops.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            "CREATE TABLE memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO memory_meta VALUES ('schema_version', '1');"
+            "CREATE TABLE memory_ops (seq INTEGER PRIMARY KEY, op_kind TEXT NOT NULL);"
+            "CREATE VIRTUAL TABLE memory_fts USING fts5("
+            "id_kind UNINDEXED, id_value UNINDEXED, field_index UNINDEXED, content);"
+        )
+        conn.commit()
+        conn.close()
+        with pytest.raises(StoreCorruption) as excinfo:
+            SqliteMemoryStore(path)
+        assert "payload" in str(excinfo.value)
+        assert "digest" in str(excinfo.value)
+
+    def test_memory_meta_missing_required_column_is_corruption(self, tmp_path: Path) -> None:
+        path = tmp_path / "wrongcols-meta.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            "CREATE TABLE memory_meta (key TEXT PRIMARY KEY);"
+            "CREATE TABLE memory_ops ("
+            "seq INTEGER PRIMARY KEY, op_kind TEXT NOT NULL, "
+            "payload BLOB NOT NULL, digest BLOB NOT NULL);"
+            "CREATE VIRTUAL TABLE memory_fts USING fts5("
+            "id_kind UNINDEXED, id_value UNINDEXED, field_index UNINDEXED, content);"
+        )
+        conn.commit()
+        conn.close()
+        with pytest.raises(StoreCorruption) as excinfo:
+            SqliteMemoryStore(path)
+        assert "value" in str(excinfo.value)
+
 
 class TestUnsupportedSchemaVersion:
     def test_wrong_schema_version_raises(self, tmp_path: Path) -> None:
@@ -979,6 +1018,23 @@ class TestProtocolConformance:
         assert isinstance(store, MemoryStore)
         store.close()
 
+    def test_resolve_return_annotation_matches_protocol_not_object(self) -> None:
+        # @runtime_checkable Protocol isinstance() checks only verify method
+        # NAMES exist, never signatures (see the test above) -- so a
+        # resolve() -> object annotation silently satisfies isinstance()
+        # while still failing static assignment (Pyright reportAssignmentType)
+        # the first time a call site types a variable/parameter as
+        # MemoryStore. Compare against the Protocol's own declared
+        # annotation directly, so this stays correct if it ever changes.
+        import inspect
+
+        from memory.store import MemoryStore
+
+        sqlite_return = inspect.signature(SqliteMemoryStore.resolve).return_annotation
+        protocol_return = inspect.signature(MemoryStore.resolve).return_annotation
+        assert sqlite_return == protocol_return
+        assert sqlite_return != "object"
+
 
 def _fts_rows(path: Path) -> list[tuple[str, str, int, str]]:
     conn = sqlite3.connect(str(path))
@@ -1667,6 +1723,94 @@ class TestBackendEquivalence:
         conn.close()
         assert count == 0  # the rejected persist() never reached the journal
 
+    def test_full_reopen_matches_reference_across_every_query_method(
+        self, tmp_path: Path
+    ) -> None:
+        """The final whole-branch review's highest-value test-hardening
+        suggestion: every other equivalence test above compares a LIVE
+        SqliteMemoryStore against InMemoryStore, in the same process, right
+        after the same calls. None of them close and reopen -- so none
+        actually prove that journal replay reconstructs a projection
+        observably identical to the reference across every query method
+        (resolve, claims_for, conflicts_for, retention_for, retrieve), for
+        a trace that includes Episode transitions (create/append/close).
+        This closes that gap in one place, subsuming the narrower per-
+        method reopen checks scattered elsewhere (e.g. ES-10, FTS reopen).
+        """
+        from memory.store import RetrievalQuery
+
+        path = tmp_path / "full-reopen-equivalence.sqlite"
+        reference = InMemoryStore()
+        durable = SqliteMemoryStore(path)
+
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="findable text",
+            at=AT, source="s", context=CTX,
+        )
+        c1: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c1"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("a"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        c2: Claim[object] = Claim(
+            id=Id(Kind("t.claim"), "c2"), subject=SUBJECT, predicate=Kind("t.p"),
+            value=Known("b"), context=CTX, asserted_by=AGENT, evidence_refs=(), at=AT,
+        )
+        contradiction = Contradiction(
+            id=Id(Kind("t.contra"), "k1"), subject=SUBJECT,
+            statements=(Ref(id=c1.id), Ref(id=c2.id)), detected_at=AT, context=CTX,
+        )
+        resolution = Resolution(
+            contradiction=Ref(id=contradiction.id), rationale="tiebreak", resolved_by=AGENT, at=AT
+        )
+        episode_id = Id(Kind("t.episode"), "ep1")
+        item = Ref(id=obs.id)
+        closed_at = WallInstant(datetime(2024, 1, 2, tzinfo=UTC))
+
+        for store in (reference, durable):
+            store.persist(obs)
+            store.persist(c1)
+            store.persist(c2)
+            store.create_episode(id=episode_id, subject=SUBJECT, context=CTX, opened_at=AT)
+            store.append_episode(episode_id, item)
+            store.close_episode(episode_id, closed_at)
+            store.persist(RetentionMark(item=Ref(id=obs.id), accessibility=ACTIVE, at=AT))
+            store.persist(contradiction)
+            store.persist(resolution)
+
+        durable.close()
+        reopened = SqliteMemoryStore(path)
+
+        from memory.episode import Episode
+
+        assert reference.resolve(obs.id) == reopened.resolve(obs.id)
+        assert reference.resolve(c1.id) == reopened.resolve(c1.id)
+        # Episode has no __eq__ (mutable, identity-compared by design, like
+        # InMemoryStore itself) -- compare its observable fields instead.
+        ref_episode = reference.resolve(episode_id)
+        dur_episode = reopened.resolve(episode_id)
+        assert isinstance(ref_episode, Episode)
+        assert isinstance(dur_episode, Episode)
+        assert ref_episode.subject == dur_episode.subject
+        assert ref_episode.context == dur_episode.context
+        assert ref_episode.opened_at == dur_episode.opened_at
+        assert ref_episode.closed_at == dur_episode.closed_at
+        assert ref_episode.items() == dur_episode.items()
+        assert (
+            reference.claims_for(SUBJECT, Kind("t.p"))
+            == reopened.claims_for(SUBJECT, Kind("t.p"))
+        )
+        assert (
+            reference.conflicts_for(SUBJECT, Kind("t.p"))
+            == reopened.conflicts_for(SUBJECT, Kind("t.p"))
+        )
+        assert reference.retention_for(obs.id) == reopened.retention_for(obs.id)
+        assert reference.retrieve(
+            RetrievalQuery(context=CTX, text="findable text"), retrieved_at=closed_at
+        ) == reopened.retrieve(
+            RetrievalQuery(context=CTX, text="findable text"), retrieved_at=closed_at
+        )
+        reopened.close()
+
 
 class TestEpisodeSqliteTransitions:
     """Dedicated live-SqliteMemoryStore proofs for Episode matrix cases not
@@ -1839,6 +1983,132 @@ class TestConstructorResourceCleanup:
         leaked_self = init_frame.f_locals["self"]
         with pytest.raises(sqlite3.ProgrammingError):
             leaked_self._conn.execute("SELECT 1")  # closed connections refuse further use
+
+    def test_non_database_file_does_not_leak_connection(self, tmp_path: Path) -> None:
+        """The final whole-branch review found this leak path was NOT
+        covered by the fix above: _present_required_tables() (the very
+        first thing __init__ calls, before the new/existing schema branch
+        is even chosen) raising on a non-SQLite file bypassed every
+        per-branch close() that existed at the time. Confirmed on Windows
+        by the file staying undeletable (a held file lock) if the
+        connection leaked -- the same signal used below.
+        """
+        path = tmp_path / "garbage.sqlite"
+        path.write_bytes(b"not a database, just bytes")
+
+        with pytest.raises(sqlite3.DatabaseError):
+            SqliteMemoryStore(path)
+
+        path.unlink()  # raises PermissionError on Windows if the connection leaked
+
+    def test_wrong_columns_schema_does_not_leak_connection(self, tmp_path: Path) -> None:
+        """The second leak path the final whole-branch review found:
+        _validate_existing_schema() raising StoreCorruption on a
+        wrong-columns table (all three required tables present, so this
+        reaches schema validation, not the earlier missing-table checks).
+        """
+        path = tmp_path / "wrong-columns.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            "CREATE TABLE memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO memory_meta VALUES ('schema_version', '1');"
+            "CREATE TABLE memory_ops (seq INTEGER PRIMARY KEY, op_kind TEXT NOT NULL);"
+            "CREATE VIRTUAL TABLE memory_fts USING fts5("
+            "id_kind UNINDEXED, id_value UNINDEXED, field_index UNINDEXED, content);"
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(StoreCorruption):
+            SqliteMemoryStore(path)
+
+        path.unlink()  # raises PermissionError on Windows if the connection leaked
+
+
+class TestWriteOperationRecovery:
+    """The final whole-branch review found _write_operation encoded its
+    payload as an EAGER argument, computed by the caller (persist(),
+    create_episode(), etc.) BEFORE _write_operation's own try/except --
+    after self._reference had already been mutated to prove legality. An
+    encoding failure in that window propagated straight out, leaving
+    self._reference durably diverged from the (still empty) journal with
+    no recovery reload ever triggered. The fix makes _write_operation take
+    a callable and run it inside its own try, so an encoding failure
+    triggers exactly the same rollback + reload as a SQLite failure.
+    """
+
+    def test_encode_failure_triggers_reference_reload_not_silent_divergence(
+        self, tmp_path: Path
+    ) -> None:
+        from unittest import mock
+
+        import memory.sqlite_store as sqlite_store_mod
+
+        path = tmp_path / "encode-failure.sqlite"
+        store = SqliteMemoryStore(path)
+        obs: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x", at=AT, source="s", context=CTX,
+        )
+
+        def boom(record: object) -> bytes:
+            raise RuntimeError("simulated encoder failure")
+
+        with mock.patch.object(sqlite_store_mod, "_encode_persist_op", boom):
+            with pytest.raises(RuntimeError, match="simulated encoder failure"):
+                store.persist(obs)
+
+        # self._reference must have been reloaded from the (still empty)
+        # durable journal -- not left holding the in-process-only obs that
+        # was applied before the encoder blew up.
+        assert store.resolve(obs.id) is None
+        assert _journal_op_kinds(path) == []
+        store.close()
+
+    def test_second_failure_during_recovery_replay_poisons_the_store(
+        self, tmp_path: Path
+    ) -> None:
+        """A failure that ALSO breaks recovery (the journal replay used to
+        reload self._reference/self._known_entity_ids) cannot be healed in
+        place: the caller already mutated those two objects directly, in
+        place, before _write_operation ever ran, and there is no
+        from-scratch replacement to discard that mutation with unless
+        replay itself succeeds. Rather than leave a torn store open (one
+        attribute stale, the other silently reset -- the original bug this
+        was found alongside), the store is closed.
+        """
+        from unittest import mock
+
+        import memory.sqlite_store as sqlite_store_mod
+
+        path = tmp_path / "double-failure.sqlite"
+        store = SqliteMemoryStore(path)
+        obs1: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="first",
+            at=AT, source="s", context=CTX,
+        )
+        store.persist(obs1)
+
+        obs2: Observation[object] = Observation(
+            id=Id(Kind("t.obs"), "o2"), subject=SUBJECT, value="second",
+            at=AT, source="s", context=CTX,
+        )
+
+        def boom_encode(record: object) -> bytes:
+            raise RuntimeError("simulated encoder failure")
+
+        with mock.patch.object(sqlite_store_mod, "_encode_persist_op", boom_encode):
+            with mock.patch.object(
+                store,
+                "_replay_journal",
+                side_effect=RuntimeError("simulated recovery replay failure"),
+            ):
+                with pytest.raises(RuntimeError, match="simulated recovery replay failure"):
+                    store.persist(obs2)
+
+        assert store._closed  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(SqliteStoreClosed):
+            store.resolve(obs1.id)
+        store.close()  # idempotent -- must not raise
 
 
 class TestDatabaseIntegrity:

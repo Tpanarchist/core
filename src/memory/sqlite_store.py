@@ -16,7 +16,7 @@ import hmac
 import os
 import sqlite3
 import struct
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import cast
 
 from core.context import Context
@@ -48,7 +48,13 @@ from memory.codec import (
 )
 from memory.recall import RecallCandidate
 from memory.retention import RetentionMark
-from memory.store import InMemoryStore, PersistRecord, RetrievalQuery, lexical_content
+from memory.store import (
+    EntityMemoryRecord,
+    InMemoryStore,
+    PersistRecord,
+    RetrievalQuery,
+    lexical_content,
+)
 
 _SCHEMA_VERSION = "1"
 _SUPPORTED_SCHEMA_VERSION = 1
@@ -136,60 +142,56 @@ class SqliteMemoryStore:
         self._conn = sqlite3.connect(str(path))
         self._conn.isolation_level = None  # manual BEGIN/COMMIT/ROLLBACK control
         self._conn.execute("PRAGMA foreign_keys = OFF")
+        # Safe defaults for the new-database branch below, which needs no
+        # further assignment; the existing-database branch replaces both
+        # together, atomically, once replay actually succeeds.
+        self._known_entity_ids: set[Id] = set()
+        self._reference: InMemoryStore = InMemoryStore()
 
-        present = self._present_required_tables()
-        if not present:
-            self._initialize_new_database()
-            self._known_entity_ids: set[Id] = set()
-            self._reference = InMemoryStore()
-        elif present == set(_REQUIRED_TABLES):
-            self._validate_existing_schema()
-            self._known_entity_ids: set[Id] = set()
-            try:
-                self._reference = self._replay_journal()
-            except Exception:
-                # _replay_journal() raises StoreCorruption for every kind of
-                # corrupted/malformed durable state (bad sequence, checksum
-                # mismatch, unknown op/record tag, semantic replay rejection,
-                # ...) -- none of its internal raise sites close self._conn,
-                # matching every OTHER constructor failure branch in this
-                # method (_initialize_new_database, _validate_existing_schema,
-                # the FTS-rebuild-after-replay block below, and the partial-
-                # schema branch), all of which close before re-raising. Left
-                # unclosed here, a corrupted database would leave a dangling
-                # open connection behind a constructor call that never
-                # returned an object the caller could call close() on -- on
-                # Windows this actually holds a file lock, confirmed by
-                # direct reproduction during this plan's pre-flight testing.
-                self._conn.close()
-                raise
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                self._rebuild_fts()
-                self._conn.execute("COMMIT")
-            except Exception:
-                # BEGIN IMMEDIATE itself can be the failing statement (e.g.
-                # lock contention from another writer -- this is exactly
-                # Matrix case DB-09, and is exercised by
-                # test_db09_second_writer_on_locked_database_fails_explicitly
-                # in Task 7). ROLLBACK then has nothing to roll back and
-                # would raise its own error, masking the real one -- same
-                # fix as _write_operation and _initialize_new_database.
-                # This failure is operational, not a corruption finding --
-                # the journal itself already replayed successfully -- so
-                # the original exception propagates as-is rather than
-                # being wrapped in StoreCorruption.
-                if self._conn.in_transaction:
-                    self._conn.execute("ROLLBACK")
-                self._conn.close()
-                raise
-        else:
+        try:
+            present = self._present_required_tables()
+            if not present:
+                self._initialize_new_database()
+            elif present == set(_REQUIRED_TABLES):
+                self._validate_existing_schema()
+                self._reference, self._known_entity_ids = self._replay_journal()
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    self._rebuild_fts()
+                    self._conn.execute("COMMIT")
+                except Exception:
+                    # BEGIN IMMEDIATE itself can be the failing statement
+                    # (e.g. lock contention from another writer -- this is
+                    # exactly Matrix case DB-09, exercised by
+                    # test_db09_second_writer_on_locked_database_fails_explicitly
+                    # in Task 7). ROLLBACK then has nothing to roll back and
+                    # would raise its own error, masking the real one --
+                    # same fix as _write_operation and
+                    # _initialize_new_database. This failure is operational,
+                    # not a corruption finding -- the journal itself already
+                    # replayed successfully -- so the original exception
+                    # propagates as-is rather than being wrapped in
+                    # StoreCorruption.
+                    if self._conn.in_transaction:
+                        self._conn.execute("ROLLBACK")
+                    raise
+            else:
+                raise StoreCorruption(
+                    None,
+                    f"partial Memory schema: found {sorted(present)}, "
+                    f"expected all of {sorted(_REQUIRED_TABLES)} or none",
+                )
+        except Exception:
+            # Every failure path inside this constructor -- new-schema init,
+            # existing-schema validation, journal replay, or the post-replay
+            # FTS rebuild -- must leave no dangling open connection behind a
+            # constructor call that never returned an object the caller
+            # could call close() on. On Windows this actually holds a file
+            # lock, confirmed by direct reproduction. One outer handler
+            # makes that a structural guarantee instead of a per-branch
+            # convention every new failure path has to remember to repeat.
             self._conn.close()
-            raise StoreCorruption(
-                None,
-                f"partial Memory schema: found {sorted(present)}, "
-                f"expected all of {sorted(_REQUIRED_TABLES)} or none",
-            )
+            raise
 
     def _present_required_tables(self) -> set[str]:
         rows = self._conn.execute(
@@ -215,35 +217,56 @@ class SqliteMemoryStore:
             # roll back and would raise its own error, masking the real one.
             if self._conn.in_transaction:
                 self._conn.execute("ROLLBACK")
-            self._conn.close()
             raise
 
     def _validate_existing_schema(self) -> None:
         integrity = self._conn.execute("PRAGMA integrity_check").fetchone()
         if integrity is None or integrity[0] != "ok":
-            self._conn.close()
             raise StoreCorruption(None, f"PRAGMA integrity_check failed: {integrity!r}")
 
         fts_sql_row = self._conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'memory_fts'"
         ).fetchone()
         if fts_sql_row is None or "fts5" not in fts_sql_row[0].lower():
-            self._conn.close()
             raise StoreCorruption(None, "memory_fts is not a valid FTS5 table")
+
+        self._require_columns("memory_meta", ("key", "value"))
+        self._require_columns("memory_ops", ("seq", "op_kind", "payload", "digest"))
 
         version_row = self._conn.execute(
             "SELECT value FROM memory_meta WHERE key = 'schema_version'"
         ).fetchone()
         if version_row is None:
-            self._conn.close()
             raise StoreCorruption(None, "memory_meta missing required 'schema_version' key")
         found = version_row[0]
         if found != _SCHEMA_VERSION:
-            self._conn.close()
             raise UnsupportedSchemaVersion(found=found, supported=_SUPPORTED_SCHEMA_VERSION)
 
-    def _replay_journal(self) -> InMemoryStore:
+    def _require_columns(self, table: str, required: tuple[str, ...]) -> None:
+        # table is always one of this module's own hardcoded literals above,
+        # never external input — PRAGMA does not accept bound parameters for
+        # object names, so this is the standard way to inspect a fixed,
+        # known table's shape.
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        found = {row[1] for row in rows}
+        missing = [name for name in required if name not in found]
+        if missing:
+            raise StoreCorruption(
+                None, f"{table} is missing required column(s): {missing}"
+            )
+
+    def _replay_journal(self) -> tuple[InMemoryStore, set[Id]]:
+        """Pure with respect to self: builds a fresh reference projection
+        and entity-id set purely from the durable journal and returns both
+        together. Callers publish the pair atomically (tuple assignment)
+        only once replay fully succeeds — self._reference and
+        self._known_entity_ids are never updated separately, so a second
+        failure during recovery (e.g. inside _write_operation's except
+        block) leaves both attributes at their last-known-good values
+        instead of one reset and the other stale.
+        """
         reference = InMemoryStore()
+        entity_ids: set[Id] = set()
         rows = self._conn.execute(
             "SELECT seq, op_kind, payload, digest FROM memory_ops ORDER BY seq ASC"
         ).fetchall()
@@ -266,7 +289,7 @@ class SqliteMemoryStore:
                 raise StoreCorruption(seq, "operation checksum mismatch")
 
             try:
-                self._apply_decoded_operation(reference, seq, op_kind, payload)
+                self._apply_decoded_operation(reference, entity_ids, seq, op_kind, payload)
             except StoreCorruption:
                 raise
             except Exception as exc:
@@ -276,21 +299,26 @@ class SqliteMemoryStore:
 
             expected_seq += 1
 
-        return reference
+        return reference, entity_ids
 
     def _apply_decoded_operation(
-        self, reference: InMemoryStore, seq: int, op_kind: str, payload: bytes
+        self,
+        reference: InMemoryStore,
+        entity_ids: set[Id],
+        seq: int,
+        op_kind: str,
+        payload: bytes,
     ) -> None:
         if op_kind == "persist":
             record = _decode_persist_op(payload, seq=seq)
             reference.persist(record)
-            self._track_entity_ids_safe(record)
+            _track_entity_ids(entity_ids, record)
         elif op_kind == "create_episode":
             episode_id, subject, context, opened_at = _decode_create_episode_op(payload, seq=seq)
             reference.create_episode(
                 id=episode_id, subject=subject, context=context, opened_at=opened_at
             )
-            self._known_entity_ids.add(episode_id)
+            entity_ids.add(episode_id)
         elif op_kind == "append_episode":
             episode, item = _decode_append_episode_op(payload, seq=seq)
             reference.append_episode(episode, item)
@@ -299,9 +327,6 @@ class SqliteMemoryStore:
             reference.close_episode(episode, at)
         else:
             raise StoreCorruption(seq, f"unknown operation kind: {op_kind!r}")
-
-    def _track_entity_ids_safe(self, record: PersistRecord) -> None:
-        _track_entity_ids(self._known_entity_ids, record)
 
     def close(self) -> None:
         if self._closed:
@@ -337,17 +362,32 @@ class SqliteMemoryStore:
                     (entity_id.kind.value, entity_id.value, field_index, text),
                 )
 
-    def _write_operation(self, op_kind: str, payload: bytes) -> None:
+    def _write_operation(self, op_kind: str, encode: Callable[[], bytes]) -> None:
         """Shared transaction wrapper for all four mutating methods. The
         caller has ALREADY applied the operation to self._reference before
-        calling this — that proved semantic legality. This method only
-        durably records it; on any SQLite failure it rolls back and
-        reloads self._reference from the last-committed journal via the
-        same replay path used at open, then re-raises.
+        calling this — that proved semantic legality. ``encode`` is a
+        callable, not an eager payload: encoding happens INSIDE this
+        method's try block so that an encoding failure (not just a SQLite
+        failure) also triggers the same recovery reload below, closing the
+        window where self._reference had already diverged from the durable
+        journal but nothing reset it. On any failure this rolls back and
+        reloads self._reference/self._known_entity_ids from the last-
+        committed journal via the same replay path used at open — as one
+        atomic pair (see _replay_journal) — then re-raises.
+
+        If that recovery replay ITSELF fails, this closes the store rather
+        than leaving it open: self._reference and self._known_entity_ids
+        were already mutated in place by the caller (persist()/
+        create_episode() etc. apply the operation before calling this, to
+        prove semantic legality first) before this method ever ran, so on
+        a double failure there is no from-scratch replacement to discard
+        that mutation with, and no later write can self-heal a store whose
+        in-memory state may already diverge from its durable journal.
         """
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             seq = self._next_seq()
+            payload = encode()
             digest = _compute_digest(seq, op_kind, payload)
             self._conn.execute(
                 "INSERT INTO memory_ops(seq, op_kind, payload, digest) VALUES (?, ?, ?, ?)",
@@ -364,15 +404,18 @@ class SqliteMemoryStore:
             # this plan's pre-flight testing. Guard it with in_transaction.
             if self._conn.in_transaction:
                 self._conn.execute("ROLLBACK")
-            self._known_entity_ids = set()
-            self._reference = self._replay_journal()
+            try:
+                self._reference, self._known_entity_ids = self._replay_journal()
+            except Exception:
+                self.close()
+                raise
             raise
 
     def persist(self, record: PersistRecord) -> None:
         self._require_open()
         self._reference.persist(record)
-        self._track_entity_ids_safe(record)
-        self._write_operation("persist", _encode_persist_op(record))
+        _track_entity_ids(self._known_entity_ids, record)
+        self._write_operation("persist", lambda: _encode_persist_op(record))
 
     def create_episode(
         self, *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant
@@ -382,20 +425,22 @@ class SqliteMemoryStore:
         self._known_entity_ids.add(id)
         self._write_operation(
             "create_episode",
-            _encode_create_episode_op(id=id, subject=subject, context=context, opened_at=opened_at),
+            lambda: _encode_create_episode_op(
+                id=id, subject=subject, context=context, opened_at=opened_at
+            ),
         )
 
     def append_episode(self, episode: Id | Ref, item: Ref) -> None:
         self._require_open()
         self._reference.append_episode(episode, item)
-        self._write_operation("append_episode", _encode_append_episode_op(episode, item))
+        self._write_operation("append_episode", lambda: _encode_append_episode_op(episode, item))
 
     def close_episode(self, episode: Id | Ref, at: WallInstant) -> None:
         self._require_open()
         self._reference.close_episode(episode, at)
-        self._write_operation("close_episode", _encode_close_episode_op(episode, at))
+        self._write_operation("close_episode", lambda: _encode_close_episode_op(episode, at))
 
-    def resolve(self, item: Id | Ref) -> object:
+    def resolve(self, item: Id | Ref) -> EntityMemoryRecord | None:
         self._require_open()
         return self._reference.resolve(item)
 
