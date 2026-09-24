@@ -185,6 +185,31 @@ class TestExistingDatabaseDetection:
             SqliteMemoryStore(path)
         assert "value" in str(excinfo.value)
 
+    def test_memory_fts_missing_required_columns_is_corruption(self, tmp_path: Path) -> None:
+        """Prereg Sec76: "Derived FTS contents may be rebuilt, but the FTS
+        schema itself must have the expected shape." Before this check
+        existed, a wrong-shape (but still genuinely FTS5) memory_fts table
+        either raised a raw sqlite3.OperationalError immediately (non-empty
+        journal, since replay's FTS rebuild fails) or -- worse -- let the
+        store open "successfully" with an empty journal, only to fail with
+        the same raw error on the first persist().
+        """
+        path = tmp_path / "wrongcols-fts.sqlite"
+        conn = sqlite3.connect(str(path))
+        conn.executescript(
+            "CREATE TABLE memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "INSERT INTO memory_meta VALUES ('schema_version', '1');"
+            "CREATE TABLE memory_ops ("
+            "seq INTEGER PRIMARY KEY, op_kind TEXT NOT NULL, "
+            "payload BLOB NOT NULL, digest BLOB NOT NULL);"
+            "CREATE VIRTUAL TABLE memory_fts USING fts5(wrong_col);"
+        )
+        conn.commit()
+        conn.close()
+        with pytest.raises(StoreCorruption) as excinfo:
+            SqliteMemoryStore(path)
+        assert "memory_fts" in str(excinfo.value)
+
 
 class TestUnsupportedSchemaVersion:
     def test_wrong_schema_version_raises(self, tmp_path: Path) -> None:
@@ -218,6 +243,19 @@ class TestStoreLifecycle:
         store = SqliteMemoryStore(path)
         store.close()
         assert path.exists()  # the db file itself stays; only the connection closes
+
+    def test_ordinary_close_message_differs_from_self_poisoned_message(
+        self, tmp_path: Path
+    ) -> None:
+        """An ordinary, caller-initiated close() must NOT be reported with
+        the same wording as a store that poisoned itself after a double
+        failure (see TestWriteOperationRecovery) -- a caller debugging
+        "why is my store closed" needs to tell the two apart.
+        """
+        store = SqliteMemoryStore(tmp_path / "ordinary-close.sqlite")
+        store.close()
+        with pytest.raises(SqliteStoreClosed, match="this SqliteMemoryStore has been closed"):
+            store.resolve(Id(Kind("t.x"), "x"))
 
 
 class TestExceptionShapes:
@@ -1734,8 +1772,13 @@ class TestBackendEquivalence:
         observably identical to the reference across every query method
         (resolve, claims_for, conflicts_for, retention_for, retrieve), for
         a trace that includes Episode transitions (create/append/close).
-        This closes that gap in one place, subsuming the narrower per-
-        method reopen checks scattered elsewhere (e.g. ES-10, FTS reopen).
+
+        Scope note: retrieve() delegates wholesale to self._reference (see
+        the class docstring above), so this test never inspects memory_fts
+        directly and is NOT a substitute for
+        TestFtsIndexing.test_reopen_rebuilds_fts_from_replayed_state, which
+        is still the only test proving _rebuild_fts() actually runs on
+        open.
         """
         from memory.store import RetrievalQuery
 
@@ -1945,18 +1988,46 @@ class TestEpisodeSnapshotIsNotAMutationMechanism:
         store.close()
 
 
+def _assert_connection_closed_after_failed_construction(
+    excinfo: pytest.ExceptionInfo[BaseException],
+) -> None:
+    """Dig the partially-constructed `self` out of a failed SqliteMemoryStore
+    construction's traceback -- the constructor never returned an instance
+    we could hold a name to, but the traceback frame for __init__ still has
+    `self` in its locals, which is exactly how a leaked connection is
+    reachable/observable at all outside the process (and exactly why it
+    matters: a closed connection refusing further use is a
+    platform-independent signal, unlike relying on a held OS file lock,
+    which only Windows actually enforces against the same process).
+    """
+    tb = excinfo.tb
+    init_frame = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "__init__":
+            init_frame = tb.tb_frame
+            break
+        tb = tb.tb_next
+    assert init_frame is not None, "expected the raise to unwind through __init__"
+    leaked_self = init_frame.f_locals["self"]
+    with pytest.raises(sqlite3.ProgrammingError):
+        leaked_self._conn.execute("SELECT 1")  # closed connections refuse further use
+
+
 class TestConstructorResourceCleanup:
+    """__init__'s entire body (after the connection is opened) runs inside
+    one outer try/except that closes self._conn on ANY failure -- a
+    structural guarantee, not a per-branch convention each new failure path
+    has to remember to repeat. Each test below forces a failure from a
+    DIFFERENT point in the constructor to prove that guarantee actually
+    covers every branch, not just the one Task 7 originally patched.
+    """
+
     def test_replay_failure_closes_connection_before_raising(self, tmp_path: Path) -> None:
-        """Every OTHER constructor failure path (_initialize_new_database,
-        _validate_existing_schema, the FTS-rebuild-after-replay step, the
-        partial-schema branch) explicitly closes self._conn before
-        re-raising. _replay_journal()'s own raise sites never close
-        anything, so the call site must -- otherwise a corrupted database
-        leaves a dangling open connection/file handle behind a constructor
-        call that never returned an object the caller could call close()
-        on. Confirmed by direct reproduction that this actually holds an OS
-        file lock (PermissionError removing the file right after, no gc
-        needed) before the fix in this task.
+        """Forces the failure inside _replay_journal(), reached via the
+        "existing schema" branch. Confirmed by direct reproduction that an
+        unclosed connection here actually holds an OS file lock on Windows
+        (PermissionError removing the file right after, no gc needed)
+        before the fix that introduced this test.
         """
         path = tmp_path / "leak-check.sqlite"
         conn = _fresh_v1_schema(path)
@@ -1966,40 +2037,21 @@ class TestConstructorResourceCleanup:
 
         with pytest.raises(StoreCorruption) as excinfo:
             SqliteMemoryStore(path)
-
-        # Dig the partially-constructed `self` out of the traceback -- the
-        # constructor never returned an instance we could hold a name to,
-        # but the traceback frame for __init__ still has `self` in its
-        # locals, which is exactly how this leak is reachable/observable at
-        # all outside the process (and exactly why it mattered).
-        tb = excinfo.tb
-        init_frame = None
-        while tb is not None:
-            if tb.tb_frame.f_code.co_name == "__init__":
-                init_frame = tb.tb_frame
-                break
-            tb = tb.tb_next
-        assert init_frame is not None, "expected the raise to unwind through __init__"
-        leaked_self = init_frame.f_locals["self"]
-        with pytest.raises(sqlite3.ProgrammingError):
-            leaked_self._conn.execute("SELECT 1")  # closed connections refuse further use
+        _assert_connection_closed_after_failed_construction(excinfo)
 
     def test_non_database_file_does_not_leak_connection(self, tmp_path: Path) -> None:
         """The final whole-branch review found this leak path was NOT
         covered by the fix above: _present_required_tables() (the very
         first thing __init__ calls, before the new/existing schema branch
         is even chosen) raising on a non-SQLite file bypassed every
-        per-branch close() that existed at the time. Confirmed on Windows
-        by the file staying undeletable (a held file lock) if the
-        connection leaked -- the same signal used below.
+        per-branch close() that existed at the time.
         """
         path = tmp_path / "garbage.sqlite"
         path.write_bytes(b"not a database, just bytes")
 
-        with pytest.raises(sqlite3.DatabaseError):
+        with pytest.raises(sqlite3.DatabaseError) as excinfo:
             SqliteMemoryStore(path)
-
-        path.unlink()  # raises PermissionError on Windows if the connection leaked
+        _assert_connection_closed_after_failed_construction(excinfo)
 
     def test_wrong_columns_schema_does_not_leak_connection(self, tmp_path: Path) -> None:
         """The second leak path the final whole-branch review found:
@@ -2019,10 +2071,9 @@ class TestConstructorResourceCleanup:
         conn.commit()
         conn.close()
 
-        with pytest.raises(StoreCorruption):
+        with pytest.raises(StoreCorruption) as excinfo:
             SqliteMemoryStore(path)
-
-        path.unlink()  # raises PermissionError on Windows if the connection leaked
+        _assert_connection_closed_after_failed_construction(excinfo)
 
 
 class TestWriteOperationRecovery:
@@ -2106,7 +2157,11 @@ class TestWriteOperationRecovery:
                     store.persist(obs2)
 
         assert store._closed  # pyright: ignore[reportPrivateUsage]
-        with pytest.raises(SqliteStoreClosed):
+        assert store._poisoned  # pyright: ignore[reportPrivateUsage]
+        # Distinct message from an ordinary close() -- a caller debugging
+        # "why is my store closed" should be told it poisoned itself, not
+        # be left to assume they (or something else) called close().
+        with pytest.raises(SqliteStoreClosed, match="closed itself after a write failed"):
             store.resolve(obs1.id)
         store.close()  # idempotent -- must not raise
 
@@ -2202,12 +2257,14 @@ class TestDatabaseIntegrity:
         so store2 must take the "existing schema" branch, never
         "_initialize_new_database") is confirmed here empirically by
         walking the traceback of the raised OperationalError and asserting
-        the failing frame is literally inside SqliteMemoryStore.__init__
-        while the object's _reference is already a *replayed* InMemoryStore
-        (proving journal replay already completed) and NOT inside
-        _initialize_new_database (which never sets self._reference from
-        _replay_journal -- it sets it directly to a fresh empty InMemoryStore
-        with no _known_entity_ids populated from replay).
+        the failing frame's self._reference already contains store1's
+        committed Observation -- possible only if _replay_journal() already
+        ran and its result was published. self._reference is always set to
+        an empty InMemoryStore() before __init__'s try block (so an
+        _initialize_new_database failure would leave it empty, not
+        vacuous/absent -- hasattr alone no longer discriminates the two
+        branches); the FTS-rebuild branch is the only one that replaces it
+        with a genuinely non-empty, replayed one before it can fail here.
         """
         path = tmp_path / "db09-branch-check.sqlite"
         store1 = SqliteMemoryStore(path)
@@ -2235,19 +2292,18 @@ class TestDatabaseIntegrity:
             tb = tb.tb_next
         assert init_frame is not None, "expected OperationalError to unwind through __init__"
         failed_self = init_frame.f_locals["self"]
-        # If this failure had instead come from _initialize_new_database
-        # (the OTHER call site that issues BEGIN IMMEDIATE), self._reference
-        # would never have been set at all by the time the exception fires,
-        # because _initialize_new_database's own BEGIN IMMEDIATE happens
-        # BEFORE self._reference is assigned in that branch. Here, self
-        # already carries a fully-replayed reference containing store1's
-        # committed Observation -- proof this is the FTS-rebuild branch,
-        # reached only after a successful _replay_journal().
-        assert hasattr(failed_self, "_reference"), (
-            "self._reference must already be set -- proves replay completed "
-            "and this is the FTS-rebuild branch, not _initialize_new_database"
+        # If this failure had instead come from _initialize_new_database,
+        # self._reference would still be the empty InMemoryStore() assigned
+        # before the try -- _initialize_new_database never touches it. Only
+        # a successful _replay_journal() (reached solely via the "existing
+        # schema" branch) can make resolve(obs.id) return the Observation
+        # store1 committed -- that is the discriminator, not attribute
+        # presence, now that self._reference is always set up front.
+        assert failed_self._reference.resolve(obs.id) == obs, (
+            "self._reference must already hold store1's replayed Observation "
+            "-- proves replay completed and this is the FTS-rebuild branch, "
+            "not _initialize_new_database"
         )
-        assert failed_self._reference.resolve(obs.id) == obs
 
         store1._conn.execute("ROLLBACK")  # pyright: ignore[reportPrivateUsage]
         store1.close()

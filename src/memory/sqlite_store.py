@@ -139,9 +139,9 @@ class SqliteMemoryStore:
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self._closed = False
+        self._poisoned = False
         self._conn = sqlite3.connect(str(path))
         self._conn.isolation_level = None  # manual BEGIN/COMMIT/ROLLBACK control
-        self._conn.execute("PRAGMA foreign_keys = OFF")
         # Safe defaults for the new-database branch below, which needs no
         # further assignment; the existing-database branch replaces both
         # together, atomically, once replay actually succeeds.
@@ -149,6 +149,7 @@ class SqliteMemoryStore:
         self._reference: InMemoryStore = InMemoryStore()
 
         try:
+            self._conn.execute("PRAGMA foreign_keys = OFF")
             present = self._present_required_tables()
             if not present:
                 self._initialize_new_database()
@@ -232,6 +233,7 @@ class SqliteMemoryStore:
 
         self._require_columns("memory_meta", ("key", "value"))
         self._require_columns("memory_ops", ("seq", "op_kind", "payload", "digest"))
+        self._require_columns("memory_fts", ("id_kind", "id_value", "field_index", "content"))
 
         version_row = self._conn.execute(
             "SELECT value FROM memory_meta WHERE key = 'schema_version'"
@@ -335,6 +337,13 @@ class SqliteMemoryStore:
         self._conn.close()
 
     def _require_open(self) -> None:
+        if self._poisoned:
+            raise SqliteStoreClosed(
+                "this SqliteMemoryStore closed itself after a write failed and the "
+                "recovery reload that would have repaired self._reference also "
+                "failed -- its in-memory state can no longer be trusted and it "
+                "must be discarded; construct a new SqliteMemoryStore for this path"
+            )
         if self._closed:
             raise SqliteStoreClosed("this SqliteMemoryStore has been closed")
 
@@ -383,6 +392,16 @@ class SqliteMemoryStore:
         a double failure there is no from-scratch replacement to discard
         that mutation with, and no later write can self-heal a store whose
         in-memory state may already diverge from its durable journal.
+
+        Deliberate deviation on that double-failure path only: the
+        exception that propagates is the recovery replay's own failure,
+        not the original write failure that triggered recovery (which
+        survives only as its __context__). Prereg's general "propagate the
+        SQLite failure" guidance describes the single-failure case; here
+        the replay failure is the more actionable signal (it means the
+        durable journal itself may no longer be readable/trustworthy,
+        which is strictly more severe than the write that merely triggered
+        the recovery attempt).
         """
         try:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -407,6 +426,7 @@ class SqliteMemoryStore:
             try:
                 self._reference, self._known_entity_ids = self._replay_journal()
             except Exception:
+                self._poisoned = True
                 self.close()
                 raise
             raise
@@ -468,15 +488,6 @@ class SqliteMemoryStore:
 _JOURNAL_FORMAT_VERSION = b"memory.sqlite.operation.v1"
 
 
-# NOTE: Task 2 produced this codec with no caller yet within this module --
-# Task 3 (_replay_journal/_apply_decoded_operation below) now calls the
-# digest and decode-side functions, so those carry no suppression anymore.
-# The encode-side functions below (_encode_persist_op and friends) still have
-# no in-module caller until Task 4 wires in the live write path, so those
-# still carry an explicit, deliberate reportUnusedFunction suppression rather
-# than a false signal of dead code. (Pyright strict's reportUnusedFunction
-# only counts in-module references -- a foreign module importing a
-# leading-underscore name, as the tests here do, does not count.)
 def _compute_digest(seq: int, op_kind: str, payload: bytes) -> bytes:
     """SHA-256 over unambiguous, length-prefixed fields — never naive
     concatenation, which would let e.g. op_kind="ab"+payload="c" collide
@@ -1010,7 +1021,7 @@ def _decode_record(data: bytes, *, seq: int | None = None) -> PersistRecord:
     return decoder(node, seq=seq)
 
 
-def _encode_persist_op(  # pyright: ignore[reportUnusedFunction]
+def _encode_persist_op(
     record: PersistRecord,
 ) -> bytes:
     return _encode_record(record)
@@ -1020,7 +1031,7 @@ def _decode_persist_op(data: bytes, *, seq: int | None = None) -> PersistRecord:
     return _decode_record(data, seq=seq)
 
 
-def _encode_create_episode_op(  # pyright: ignore[reportUnusedFunction]
+def _encode_create_episode_op(
     *, id: Id, subject: Id | Ref, context: Context, opened_at: WallInstant
 ) -> bytes:
     tree = (
@@ -1048,7 +1059,7 @@ def _decode_create_episode_op(
     )
 
 
-def _encode_append_episode_op(  # pyright: ignore[reportUnusedFunction]
+def _encode_append_episode_op(
     episode: Id | Ref, item: Ref
 ) -> bytes:
     tree = ("append_episode", _encode_id_or_ref(episode), encode_ref(item))
@@ -1066,7 +1077,7 @@ def _decode_append_episode_op(data: bytes, *, seq: int | None = None) -> tuple[I
     )
 
 
-def _encode_close_episode_op(  # pyright: ignore[reportUnusedFunction]
+def _encode_close_episode_op(
     episode: Id | Ref, at: WallInstant
 ) -> bytes:
     tree = ("close_episode", _encode_id_or_ref(episode), encode_wall_instant(at))
