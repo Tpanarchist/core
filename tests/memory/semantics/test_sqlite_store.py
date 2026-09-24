@@ -21,7 +21,7 @@ from core.effect import Effect
 from core.epistemic import Claim, Contradiction, Inference, Resolution
 from core.error import Error
 from core.event import Event
-from core.identity import Id, Namespace, Ref
+from core.identity import Entity, Id, Namespace, Ref
 from core.observation import Observation
 from core.provenance import Provenance
 from core.time import Duration, WallInstant
@@ -1072,6 +1072,53 @@ class TestProtocolConformance:
         protocol_return = inspect.signature(MemoryStore.resolve).return_annotation
         assert sqlite_return == protocol_return
         assert sqlite_return != "object"
+
+
+class TestRefClosure:
+    def test_rf_08_sqlite_memory_store_public_surface_matches_protocol_plus_close(
+        self, tmp_path: Path
+    ) -> None:
+        # MEMORY_ADVERSARIAL_MATRIX.md RF-08: an application wanting to
+        # reference a non-Entity storage row must reference some real
+        # Entity instead -- storage position is never promoted. Proven the
+        # same way test_pa_09_10_11_public_surface_matches_protocol_exactly
+        # proves it for InMemoryStore: there is no OTHER public method at
+        # all through which a storage-local position could leak out.
+        # Unlike InMemoryStore (no lifecycle to manage), SqliteMemoryStore
+        # legitimately adds `close` to its own public surface -- confirmed
+        # by direct comparison, not assumed.
+        store = SqliteMemoryStore(tmp_path / "rf08.sqlite")
+        try:
+            public_attrs = {name for name in dir(store) if not name.startswith("_")}
+            protocol_methods = {
+                "persist", "resolve", "retrieve", "claims_for", "conflicts_for",
+                "retention_for", "create_episode", "append_episode", "close_episode",
+                "close",
+            }
+            assert public_attrs == protocol_methods
+        finally:
+            store.close()
+
+    def test_rf_07_sqlite_local_sequence_key_is_a_plain_int_never_entity(
+        self, tmp_path: Path
+    ) -> None:
+        # MEMORY_ADVERSARIAL_MATRIX.md RF-07: the SQLite local sequence key
+        # (memory_ops.seq) does not satisfy Entity -- it is a bare int,
+        # never wrapped in an Id/Ref-shaped value anywhere in this module.
+        store = SqliteMemoryStore(tmp_path / "rf07.sqlite")
+        try:
+            obs: Observation[object] = Observation(
+                id=Id(Kind("t.obs"), "o1"), subject=SUBJECT, value="x",
+                at=AT, source="s", context=CTX,
+            )
+            store.persist(obs)
+            conn = sqlite3.connect(str(tmp_path / "rf07.sqlite"))
+            seq_value = conn.execute("SELECT seq FROM memory_ops LIMIT 1").fetchone()[0]
+            conn.close()
+            assert type(seq_value) is int
+            assert not isinstance(seq_value, Entity)
+        finally:
+            store.close()
 
 
 def _fts_rows(path: Path) -> list[tuple[str, str, int, str]]:

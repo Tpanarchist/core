@@ -13,7 +13,7 @@ from _memory_side_effects import assert_fresh_import_has_no_side_effects
 
 from core.context import Context
 from core.epistemic import Claim, Contradiction, Resolution
-from core.identity import Id, Namespace, Ref
+from core.identity import Entity, Id, Namespace, Ref
 from core.time import WallInstant
 from core.value import Kind, Known
 from memory.belief import (
@@ -592,6 +592,15 @@ class TestBeliefProjectionConstructorInvariants:
                 status=Kind("memory.belief.not_a_real_status"),
                 candidates=(claim,), conflict_entries=(),
             )
+
+    def test_rf_05_belief_projection_not_entity_bearing(self) -> None:
+        # MEMORY_ADVERSARIAL_MATRIX.md RF-05: a BeliefProjection Ref is
+        # impossible -- BeliefProjection carries no id field.
+        projection = belief_state(
+            subject=SUBJECT, predicate=BALANCE, query_context=ctx(MONDAY),
+            claims=(), conflict_entries=(),
+        )
+        assert not isinstance(projection, Entity)
 
 
 class TestQueryContextRetained:

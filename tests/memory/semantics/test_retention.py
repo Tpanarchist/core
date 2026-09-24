@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 from _memory_side_effects import assert_fresh_import_has_no_side_effects
 
-from core.identity import Id, Namespace, Ref
+from core.identity import Entity, Id, Namespace, Ref
 from core.time import WallInstant
 from core.value import Kind
 from memory.retention import ACTIVE, ARCHIVED, DEPRIORITIZED, RetentionLog, RetentionMark
@@ -104,6 +104,14 @@ class TestHistorySnapshot:
         log.record(mark(item, ARCHIVED, T2))
         assert snapshot == (mark(item, ACTIVE, T1),)
         assert len(log.history(item)) == 2
+
+
+class TestRefClosure:
+    def test_rf_04_retention_mark_not_entity_bearing(self) -> None:
+        # MEMORY_ADVERSARIAL_MATRIX.md RF-04: a RetentionMark Ref is
+        # impossible -- RetentionMark carries no id field.
+        mark = RetentionMark(item=Ref(id=Id(ITEM_KIND, "x")), accessibility=ACTIVE, at=T1)
+        assert not isinstance(mark, Entity)
 
 
 class TestImportSideEffects:

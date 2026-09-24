@@ -148,6 +148,13 @@ class TestWorkingSetConstruction:
         with pytest.raises(ValueError):
             WorkingSet(capacity=1, admitted=(candidate("a"), candidate("b")))
 
+    def test_rf_03_working_set_not_entity_bearing(self) -> None:
+        # MEMORY_ADVERSARIAL_MATRIX.md RF-03: a WorkingSet Ref is impossible
+        # -- WorkingSet carries no id field, exactly like RecallCandidate
+        # (see test_rc_not_entity_bearing_in_v0 above).
+        ws = WorkingSet(capacity=1, admitted=())
+        assert not isinstance(ws, Entity)
+
 
 class TestImportSideEffects:
     def test_recall_import_has_no_side_effects(self) -> None:
