@@ -10,3 +10,5 @@ dist/
 build/
 .coverage
 htmlcov/
+.uv-cache/
+.finance/
