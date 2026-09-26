@@ -6,7 +6,7 @@ import argparse
 import csv
 import sys
 from calendar import monthrange
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import cast
@@ -14,6 +14,8 @@ from typing import cast
 from core.identity import Id, Ref
 from core.result import Err
 from core.value import Kind
+from personal_finance.adapters.coinbase import CoinbaseReadError
+from personal_finance.adapters.coinbase import preview as coinbase_preview
 from personal_finance.adapters.memory import FinanceMemory
 from personal_finance.adapters.sqlite import FinanceStore
 from personal_finance.application.service import FinanceService
@@ -203,6 +205,12 @@ def _parser() -> argparse.ArgumentParser:
     close.add_argument("month", help="YYYY-MM")
     close.add_argument("reason")
     commands.add_parser("memory-sync", help="Retry optional local evidence indexing")
+    coinbase = commands.add_parser(
+        "coinbase-preview", help="Read Coinbase balances and recent fills without posting"
+    )
+    coinbase.add_argument("--key-file", type=Path, help="Downloaded read-only CDP key JSON")
+    coinbase.add_argument("--fill-pages", type=int, choices=range(1, 21), default=5)
+    coinbase.add_argument("--all-accounts", action="store_true")
     recall = commands.add_parser("recall", help="Find retained finance evidence in Memory")
     recall.add_argument("text", help="Literal text to find in accepted change evidence")
     recall.add_argument("--limit", type=int, default=20)
@@ -450,6 +458,43 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     data_dir = args.data_dir if isinstance(args.data_dir, Path) else default_data_dir()
     try:
+        if args.command == "coinbase-preview":
+            if args.demo:
+                raise ValueError("Coinbase live access is unavailable in the synthetic demo")
+            try:
+                result = coinbase_preview(
+                    key_file=args.key_file, max_fill_pages=int(args.fill_pages)
+                )
+            except CoinbaseReadError as exc:
+                print(f"Coinbase: {exc}", file=sys.stderr)
+                return 1
+            retrieved_at = datetime.now(UTC).isoformat()
+            print(
+                f"Coinbase read-only preview — no finance records changed; retrieved {retrieved_at}"
+            )
+            shown = tuple(
+                item
+                for item in result.balances
+                if args.all_accounts or item.available != 0 or item.hold != 0
+            )
+            print(f"Accounts: {len(result.balances)} returned; {len(shown)} shown")
+            for item in shown:
+                print(
+                    f"{safe_display(item.name)} [{safe_display(item.currency)}] "
+                    f"available {item.available}; hold {item.hold}"
+                )
+            coverage = "complete" if result.fills_complete else "partial"
+            print(f"Recent fills: {len(result.fills)} returned ({coverage} coverage)")
+            for item in result.fills[:20]:
+                print(
+                    f"{safe_display(item.trade_time)} | {safe_display(item.product_id)} | "
+                    f"size {item.size} @ {item.price}; fee {item.commission}"
+                )
+            if len(result.fills) > 20:
+                print(f"{len(result.fills) - 20} further fills omitted from display")
+            if not result.fills_complete:
+                print("Fill history is incomplete; no coverage or totals are asserted.")
+            return 0
         service = open_service(data_dir, demo=bool(args.demo))
         if args.demo:
             print("SYNTHETIC DEMO — isolated from your personal book")

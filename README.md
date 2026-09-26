@@ -343,6 +343,20 @@ directory, including any SQLite sidecar files. Secure that copy using your norma
 encrypted backup system. CSV exports preserve inspectable postings but are not a
 complete backup of drafts, approvals, audit, or derivation records.
 
+### Coinbase read-only preview
+
+`personal-finance coinbase-preview` reads Coinbase Advanced Trade accounts and
+recent fills using the official Python SDK. Set `core_read` to the path of a
+downloaded CDP key JSON file, or pass `--key-file` with that path. Do not put
+the key contents in a command, repository, or finance database. The connector
+checks Coinbase's key-permissions endpoint first and refuses keys with trade or
+transfer access. It calls only account and fill read endpoints. `--all-accounts`
+shows zero-balance accounts; `--fill-pages` can extend the default five-page
+fill preview (maximum 20). The output labels retrieval time and incomplete fill
+coverage. It does not stage, post, value, or reconcile anything yet, and no
+Coinbase response is persisted. The key can see only its permitted portfolio,
+which might be less than the user's full Coinbase account history.
+
 ### Verification and remaining slices
 
 ```powershell
@@ -359,5 +373,5 @@ dependency direction, import-time side effects, and headless Textual keyboard an
 layout flows. The baseline before finance work was 714 existing passing tests;
 Core and Memory were not edited for this application.
 
-Authenticated MCP, read-only connectors, and verified backup/restore recovery
-follow in later slices specified by the brief.
+Authenticated MCP, staged connector imports, and verified backup/restore
+recovery follow in later slices specified by the brief.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
@@ -26,6 +26,8 @@ from core.error import Error
 from core.identity import Id
 from core.result import Err, Result
 from core.time import SystemClock
+from personal_finance.adapters.coinbase import CoinbasePreview
+from personal_finance.adapters.coinbase import preview as coinbase_preview
 from personal_finance.adapters.memory import FinanceMemory, RecallResult
 from personal_finance.adapters.sqlite import FinanceStore
 from personal_finance.application.cash_projection import CashPoint, CashProjection
@@ -311,6 +313,7 @@ class FinanceApp(App[None]):
         Binding("e", "export_csv", "Export", show=False),
         Binding("x", "explain", "Explain", show=False),
         Binding("z", "recall", "Recall", show=False),
+        Binding("k", "coinbase_preview", "Coinbase", show=False),
         Binding("c", "cash_manage", "Cash plan", show=False),
         Binding("m", "model_manage", "Manage", show=False),
         Binding("u", "reconcile_manage", "Statement review", show=False),
@@ -526,6 +529,11 @@ class FinanceApp(App[None]):
                 self.action_recall,
             ),
             (
+                "Preview Coinbase",
+                "Read balances and recent fills without changing finance records",
+                self.action_coinbase_preview,
+            ),
+            (
                 "Review selected draft",
                 "Inspect or review the selected register row",
                 self.action_detail,
@@ -568,6 +576,48 @@ class FinanceApp(App[None]):
             TextPrompt("EVIDENCE RECALL", "Literal text in retained finance change evidence"),
             self._recall_text,
         )
+
+    def action_coinbase_preview(self) -> None:
+        if self.demo:
+            self._status("Live Coinbase access is unavailable in the synthetic demo.", error=True)
+            return
+        self._status("Reading Coinbase with the view-only key…")
+        self._perform(coinbase_preview, self._coinbase_ready)
+
+    def _coinbase_ready(self, result: CoinbasePreview) -> None:
+        observed_at = datetime.now(UTC).isoformat()
+        nonzero = tuple(item for item in result.balances if item.available != 0 or item.hold != 0)
+        lines = [
+            "SOURCE · Coinbase Advanced Trade",
+            f"Retrieved · {observed_at}",
+            "Read-only evidence; finance ledger and valuations unchanged.",
+            f"Accounts returned · {len(result.balances)}; nonzero · {len(nonzero)}",
+            "",
+            "BALANCES · each currency separate",
+        ]
+        lines.extend(
+            f"{safe_display(item.name)} [{safe_display(item.currency)}] · "
+            f"available {item.available}; hold {item.hold}"
+            for item in nonzero[:50]
+        )
+        if len(nonzero) > 50:
+            lines.append(f"{len(nonzero) - 50} more nonzero accounts omitted from view")
+        lines.extend(
+            (
+                "",
+                f"RECENT FILLS · {len(result.fills)} returned · "
+                f"{'complete' if result.fills_complete else 'partial'} coverage",
+            )
+        )
+        lines.extend(
+            f"{safe_display(item.trade_time)} · {safe_display(item.product_id)} · "
+            f"size {item.size} @ {item.price}; fee {item.commission}"
+            for item in result.fills[:20]
+        )
+        if not result.fills_complete:
+            lines.append("History incomplete; no totals or coverage are asserted.")
+        self.push_screen(InfoScreen("COINBASE READ-ONLY PREVIEW", "\n".join(lines)))
+        self._status("Coinbase preview complete; finance records unchanged.")
 
     def _recall_text(self, query: str | None) -> None:
         if query is None or not query.strip():

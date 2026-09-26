@@ -178,6 +178,17 @@ for exact ledger, audit, and reconciliation truth; Memory provides bounded
 literal-text evidence recall with source, subject, time, and relevance. No Core
 or Memory module was modified for this integration.
 
+## Coinbase read-only boundary
+
+The first Coinbase connector boundary is a non-persistent preview. It resolves
+a downloaded CDP key JSON file only on explicit use, verifies that the live key
+has view access without trade or transfer access, and reads paginated Advanced
+Trade accounts and fills through the official SDK. The local preview labels
+retrieval time and partial fill coverage. It does not assert completeness beyond
+the key's portfolio, create Core observations, change the ledger, or persist
+Coinbase content. Durable staged observations and review remain a later
+construction, after verified finance backup/restore.
+
 ## Dependency boundary
 
 Textual and CLI call finance application services. Services depend on immutable
